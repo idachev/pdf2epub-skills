@@ -119,6 +119,20 @@ def test_assigns_sequential_ascii_ids():
     assert "## Глава първа {#sec-0002}" in out
 
 
+def test_single_line_backtick_paragraph_does_not_open_a_fence():
+    # a ```x``` inline-code paragraph must not swallow every later heading
+    md = "```x``` some inline code in prose\n\n## Заглавие\n\ntext"
+    out = common.assign_ascii_heading_ids(md)
+    assert "## Заглавие {#sec-0001}" in out
+
+
+def test_fence_close_requires_fence_chars_only():
+    md = "```python\n# code comment\n```\n\n# Real heading\n"
+    out = common.assign_ascii_heading_ids(md)
+    assert "# code comment {#sec" not in out
+    assert "# Real heading {#sec-0001}" in out
+
+
 def test_skips_hash_lines_inside_code_fences():
     md = "# Real heading\n\n```\n# not a heading\n```\n"
     out = common.assign_ascii_heading_ids(md)

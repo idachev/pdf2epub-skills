@@ -67,8 +67,11 @@ def work_dir(args: argparse.Namespace, parser_name: str) -> Path:
     (or a re-downloaded/fixed PDF with the same name) never reuse each other's cache."""
     if not args.input_pdf.is_file():
         sys.exit(f"error: input PDF not found: {args.input_pdf}")
-    digest = hashlib.sha256(args.input_pdf.read_bytes()).hexdigest()[:8]
-    d = args.workdir / f"{args.input_pdf.stem}-{digest}" / parser_name
+    h = hashlib.sha256()
+    with args.input_pdf.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    d = args.workdir / f"{args.input_pdf.stem}-{h.hexdigest()[:8]}" / parser_name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -366,7 +369,16 @@ def strip_watermarks(md: str, watermark_hosts: set[str]) -> str:
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
-_FENCE_RE = re.compile(r"^(```|~~~)")
+# opening fence: ``` plus an info string with no further backticks (so a single-line
+# `` ```x``` inline `` paragraph never opens a fence that would swallow the rest of
+# the book); closing fence: fence characters only
+_FENCE_OPEN_RE = re.compile(r"(`{3,}[^`]*|~{3,}.*)")
+_FENCE_CLOSE_RE = re.compile(r"(`{3,}|~{3,})\s*")
+
+
+def _toggles_fence(line: str, in_fence: bool) -> bool:
+    rule = _FENCE_CLOSE_RE if in_fence else _FENCE_OPEN_RE
+    return bool(rule.fullmatch(line.strip()))
 
 
 def assign_ascii_heading_ids(md: str) -> str:
@@ -380,7 +392,7 @@ def assign_ascii_heading_ids(md: str) -> str:
     in_fence = False
     out_lines = []
     for line in md.splitlines():
-        if _FENCE_RE.match(line.lstrip()):
+        if _toggles_fence(line, in_fence):
             in_fence = not in_fence
             out_lines.append(line)
             continue

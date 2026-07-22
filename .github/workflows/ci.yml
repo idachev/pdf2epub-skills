@@ -16,4 +16,5 @@ jobs:
           python3 -m json.tool .claude-plugin/marketplace.json > /dev/null
           python3 -m json.tool plugins/pdf2epub/.claude-plugin/plugin.json > /dev/null
       - name: Run unit tests
-        run: uvx pytest tests/ -q
+        # pin the interpreter: common.py uses PEP 604 unions, which need Python >= 3.10
+        run: uvx --python 3.12 pytest tests/ -q
