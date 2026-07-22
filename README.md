@@ -26,7 +26,7 @@ PDF ──1──▶ Markdown ──2──▶ cleaned chunks ──3──▶ c
 
 ## Requirements
 
-- Linux with [uv](https://docs.astral.sh/uv/) and [pandoc](https://pandoc.org/) on `PATH` (Python dependencies are declared inline in the script and resolved by `uv run` automatically)
+- Linux or macOS with [uv](https://docs.astral.sh/uv/) and [pandoc](https://pandoc.org/) on `PATH` (Python dependencies are declared inline in the script and resolved by `uv run` automatically)
 - `GEMINI_API_KEY` environment variable
 
 ## Direct CLI usage
@@ -53,7 +53,7 @@ The EPUB lands next to the PDF as `<name>.epub`; `--keep-md` also keeps the comp
 
 ## Reliability behavior
 
-- **Checkpoints & resume** — every cleaned chunk is written atomically to `tmp/pdf2epub/<book>/pymupdf/chunks/`; rerunning skips finished chunks, so interrupted runs lose nothing. Delete the book's workdir to force a fresh run.
+- **Checkpoints & resume** — every cleaned chunk is written atomically to `tmp/pdf2epub/<book>-<hash>/pymupdf/chunks/` (the suffix is a content hash of the PDF, so same-named or modified PDFs never collide); rerunning skips finished chunks, so interrupted runs lose nothing. Delete the book's workdir to force a fresh run.
 - **Fidelity guard** — each cleaned chunk must stay within a 0.70–1.20 output/input word ratio (one retry, then the run aborts loudly), so silent LLM truncation or paraphrasing can't slip through.
 - **Safety-filter fallback** — Gemini's copyrighted-text filter rejects chunks that combine the book's title, author, and body text; such chunks are bisected by paragraph and any still-blocked paragraph is kept verbatim.
 - **Rate limits** — API calls retry with exponential backoff; each parallel worker backs off independently.

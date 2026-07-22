@@ -4,6 +4,7 @@ Used by convert_pymupdf.py (local PyMuPDF4LLM extraction + Gemini cleanup).
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -62,7 +63,12 @@ def base_arg_parser(parser_name: str) -> argparse.ArgumentParser:
 
 
 def work_dir(args: argparse.Namespace, parser_name: str) -> Path:
-    d = args.workdir / args.input_pdf.stem / parser_name
+    """Checkpoint dir keyed by stem + content hash, so two PDFs that share a filename
+    (or a re-downloaded/fixed PDF with the same name) never reuse each other's cache."""
+    if not args.input_pdf.is_file():
+        sys.exit(f"error: input PDF not found: {args.input_pdf}")
+    digest = hashlib.sha256(args.input_pdf.read_bytes()).hexdigest()[:8]
+    d = args.workdir / f"{args.input_pdf.stem}-{digest}" / parser_name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -93,7 +99,14 @@ class PromptBlockedError(RuntimeError):
     """The input was rejected by Gemini's non-configurable content filter."""
 
 
-def generate(client, model: str, contents, system_instruction: str, max_retries: int = 5) -> str:
+def generate(
+    client,
+    model: str,
+    contents,
+    system_instruction: str,
+    max_retries: int = 5,
+    temperature: float = 0.1,
+) -> str:
     """generate_content with exponential backoff on rate limits / transient errors."""
     from google.genai import errors, types
 
@@ -105,7 +118,7 @@ def generate(client, model: str, contents, system_instruction: str, max_retries:
                 model=model,
                 contents=contents,
                 config=types.GenerateContentConfig(
-                    system_instruction=system_instruction, temperature=0.1
+                    system_instruction=system_instruction, temperature=temperature
                 ),
             )
             if resp.prompt_feedback and resp.prompt_feedback.block_reason:
@@ -143,13 +156,30 @@ _TERMINAL_PUNCT = tuple('.!?…:;"\'»)*')
 
 
 def strip_page_artifacts(md: str) -> str:
-    """Drop page-separator rules and bare page-number lines left by local extractors."""
+    """Drop page-break rules and adjacent page-number lines left by local extractors.
+
+    PyMuPDF4LLM marks each page break with a hyphen rule (`-----`); a bare number
+    is treated as a page number only when it sits next to such a rule. Standalone
+    numbers elsewhere (bare chapter numbers, years) and `***`/`___` rules (often
+    scene breaks in the book itself) are kept — the LLM cleanup pass handles any
+    stragglers, but must never be the reason real content disappears."""
+    lines = md.splitlines()
+    is_rule = [bool(re.fullmatch(r"-{3,}", line.strip())) for line in lines]
+
+    def next_to_rule(idx: int) -> bool:
+        for step in (-1, 1):
+            j = idx + step
+            while 0 <= j < len(lines) and not lines[j].strip():
+                j += step
+            if 0 <= j < len(lines) and is_rule[j]:
+                return True
+        return False
+
     kept = []
-    for line in md.splitlines():
-        s = line.strip()
-        if re.fullmatch(r"[-*_]{3,}", s):
+    for i, line in enumerate(lines):
+        if is_rule[i]:
             continue
-        if re.fullmatch(r"\d{1,4}", s):
+        if re.fullmatch(r"\d{1,4}", line.strip()) and next_to_rule(i):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -194,7 +224,7 @@ def chunk_markdown(md: str, target_words: int = TARGET_CHUNK_WORDS) -> list[str]
 # ----------------------------------------- Stage 2: LLM cleanup with checkpoints
 
 
-def _clean_text(client, model: str, text: str, prompt: str) -> str:
+def _clean_text(client, model: str, text: str, prompt: str, temperature: float = 0.1) -> str:
     """Clean one piece of text; on an input-filter block, bisect by paragraph and recurse.
 
     Gemini's copyrighted-text filter can reject a chunk (typically one combining the
@@ -202,15 +232,15 @@ def _clean_text(client, model: str, text: str, prompt: str) -> str:
     a single paragraph that is still blocked is kept verbatim.
     """
     try:
-        return generate(client, model, text, prompt)
+        return generate(client, model, text, prompt, temperature=temperature)
     except PromptBlockedError as e:
         blocks = text.split("\n\n")
         if len(blocks) == 1:
             print(f"  warning: paragraph blocked by input filter ({e}); kept verbatim", file=sys.stderr)
             return text
         mid = len(blocks) // 2
-        left = _clean_text(client, model, "\n\n".join(blocks[:mid]), prompt)
-        right = _clean_text(client, model, "\n\n".join(blocks[mid:]), prompt)
+        left = _clean_text(client, model, "\n\n".join(blocks[:mid]), prompt, temperature)
+        right = _clean_text(client, model, "\n\n".join(blocks[mid:]), prompt, temperature)
         return left + "\n\n" + right
 
 
@@ -226,9 +256,11 @@ def clean_chunks(
     verify fidelity by word-count ratio. Order of results matches input order."""
     from concurrent.futures import ThreadPoolExecutor
 
+    from google.genai import errors
+
     prompt = load_prompt("clean_chunk")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    todo = chunks[:max_chunks] if max_chunks else chunks
+    todo = chunks[:max_chunks] if max_chunks is not None else chunks
     total = len(todo)
 
     def clean_one(numbered: tuple[int, str]) -> str:
@@ -239,7 +271,21 @@ def clean_chunks(
             return ckpt.read_text(encoding="utf-8")
         out, ratio = "", 0.0
         for attempt in (1, 2):
-            out = _clean_text(client, model, chunk, prompt)
+            attempt_prompt, temperature = prompt, 0.1
+            if attempt == 2:
+                # a same-prompt low-temperature retry would mostly reproduce attempt 1;
+                # tell the model what went wrong and let it explore a little more
+                drift = (
+                    "dropped or summarized parts of the source text"
+                    if ratio < FIDELITY_BOUNDS[0]
+                    else "added or duplicated content that is not in the source text"
+                )
+                attempt_prompt = (
+                    f"{prompt}\n\nIMPORTANT: a previous attempt {drift}. Reproduce the "
+                    "source text fully and exactly; remove only layout artifacts."
+                )
+                temperature = 0.4
+            out = _clean_text(client, model, chunk, attempt_prompt, temperature)
             ratio = len(out.split()) / max(1, len(chunk.split()))
             if FIDELITY_BOUNDS[0] <= ratio <= FIDELITY_BOUNDS[1]:
                 break
@@ -259,17 +305,46 @@ def clean_chunks(
             return list(pool.map(clean_one, enumerate(todo, 1)))
         except RuntimeError as e:
             sys.exit(f"error: {e}")
+        except errors.APIError as e:
+            # non-retryable API failure (e.g. invalid key, quota exhausted) raised in a
+            # worker thread — exit cleanly instead of dumping a multi-thread traceback
+            sys.exit(f"error: Gemini API call failed: {e}")
 
 
 # --------------------------------------- Stage 3 + 4: metadata, compile, output
 
 
+def _single_line(value) -> str | None:
+    """Coerce an LLM-supplied metadata field to a clean single-line string (or None)."""
+    if not isinstance(value, str):
+        return None
+    collapsed = " ".join(value.split())
+    return collapsed or None
+
+
+_LANGUAGE_RE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*")
+
+
+def validate_language(value) -> str | None:
+    """Accept only a plausible BCP-47 code — the model can answer e.g. "English"
+    despite the prompt, which must not end up in the EPUB's dc:language."""
+    if isinstance(value, str) and _LANGUAGE_RE.fullmatch(value.strip()):
+        return value.strip()
+    return None
+
+
 def extract_metadata(client, model: str, sample_text: str) -> tuple[str | None, str | None, str | None]:
+    from google.genai import errors
+
     try:
         out = generate(client, model, sample_text[:8000], load_prompt("extract_metadata"))
         data = json.loads(out)
-        return data.get("title"), data.get("author"), data.get("language")
-    except (PromptBlockedError, json.JSONDecodeError, AttributeError):
+        title = _single_line(data.get("title"))
+        author = _single_line(data.get("author"))
+        language = validate_language(data.get("language"))
+        return title, author, language
+    except (PromptBlockedError, json.JSONDecodeError, AttributeError, errors.APIError) as e:
+        print(f"  warning: metadata extraction failed ({e}); using fallbacks", file=sys.stderr)
         return None, None, None
 
 
@@ -290,7 +365,8 @@ def strip_watermarks(md: str, watermark_hosts: set[str]) -> str:
     return "\n\n".join(b for b in blocks if _normalize_host(b) not in normalized_hosts)
 
 
-_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
+_FENCE_RE = re.compile(r"^(```|~~~)")
 
 
 def assign_ascii_heading_ids(md: str) -> str:
@@ -298,19 +374,30 @@ def assign_ascii_heading_ids(md: str) -> str:
     regardless of Markdown's auto_identifiers setting; for Cyrillic headings that
     produces non-ASCII ids that fail strict EPUB id validation (e.g. Calibre's
     checker, some e-reader engines). Assign explicit ASCII ids via pandoc's
-    `{#id}` header-attribute syntax so the writer uses those instead."""
+    `{#id}` header-attribute syntax so the writer uses those instead.
+    Lines inside fenced code blocks are left untouched."""
     counter = 0
-
-    def repl(m: re.Match) -> str:
-        nonlocal counter
-        counter += 1
-        return f"{m.group(1)} {m.group(2)} {{#sec-{counter:04d}}}"
-
-    return _HEADING_RE.sub(repl, md)
+    in_fence = False
+    out_lines = []
+    for line in md.splitlines():
+        if _FENCE_RE.match(line.lstrip()):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        m = None if in_fence else _HEADING_RE.match(line)
+        if m:
+            counter += 1
+            out_lines.append(f"{m.group(1)} {m.group(2)} {{#sec-{counter:04d}}}")
+        else:
+            out_lines.append(line)
+    result = "\n".join(out_lines)
+    return result + "\n" if md.endswith("\n") else result
 
 
 def build_frontmatter(title: str, author: str, language: str) -> str:
-    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    # collapse newlines first (a multi-line value would break the single-line
+    # double-quoted YAML scalar), then escape for the double quotes
+    esc = lambda s: " ".join(str(s).split()).replace("\\", "\\\\").replace('"', '\\"')
     # pandoc reads `lang` (not `language`) for the EPUB dc:language element
     return f'---\ntitle: "{esc(title)}"\nauthor: "{esc(author)}"\nlang: "{esc(language)}"\n---\n\n'
 
@@ -342,6 +429,7 @@ def finalize(args: argparse.Namespace, parser_name: str, cleaned_chunks: list[st
         encoding="utf-8",
     )
     epub_path = args.output or args.input_pdf.parent / f"{args.input_pdf.stem}.epub"
+    epub_path.parent.mkdir(parents=True, exist_ok=True)
     compile_epub(md_path, epub_path)
     if args.keep_md:
         kept = epub_path.with_suffix(".md")

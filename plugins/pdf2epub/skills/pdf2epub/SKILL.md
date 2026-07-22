@@ -32,7 +32,7 @@ Options:
 | `--workdir PATH` | Checkpoint dir (default: `tmp/pdf2epub`) |
 | `--strip-watermark HOST` | Domain (e.g. `scan-site.com`) whose standalone-URL paragraphs get dropped as a distributor watermark; repeatable, no domains stripped by default |
 
-For a full book run, log output per the build-script convention:
+For a full book run, capture the full output to a timestamped log file — a buried error can then be re-read without rerunning (and re-paying for) the conversion:
 
 ```bash
 mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/convert_pymupdf.py "/path/to/book.pdf" \
@@ -41,7 +41,7 @@ mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/convert_pymupdf.py "/pa
 
 ## Behavior to know
 
-- **Resume:** every cleaned chunk is checkpointed under `<workdir>/<pdf-stem>/pymupdf/chunks/`; rerunning skips cached chunks. Stage-1 extraction is cached as `extracted.md`. Delete the book's workdir to force a fresh run.
+- **Resume:** every cleaned chunk is checkpointed under `<workdir>/<pdf-stem>-<hash>/pymupdf/chunks/` (the 8-char suffix is a content hash of the PDF, so same-named or modified PDFs never reuse each other's cache); rerunning skips cached chunks. Stage-1 extraction is cached as `extracted.md`. Delete the book's workdir to force a fresh run.
 - **Fidelity check:** each cleaned chunk must keep a 0.70–1.20 output/input word ratio; one retry, then the run aborts loudly. Inspect the offending chunk in the checkpoint dir.
 - **Safety-filter blocks:** Gemini's input filter (and output-side `finish_reason` blocks like `SAFETY`/`RECITATION`) rejects chunks combining the book's title+author with body text. The pipeline auto-bisects blocked chunks and keeps still-blocked single paragraphs verbatim — warnings appear on stderr; this is expected for chunk 1.
 - **Watermark stripping:** pass one or more `--strip-watermark HOST` flags for domains found in the source scan (e.g. a distributor site plugging itself in a standalone paragraph); `strip_watermarks()` (Stage 3) then deterministically drops paragraphs that are only that URL. The cleanup prompt also asks the LLM to strip obvious scan-site watermarks heuristically, but the deterministic pass is the actual guarantee — use it whenever a book's source PDF carries a known watermark domain.
@@ -52,7 +52,7 @@ mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/convert_pymupdf.py "/pa
 
 ## Verify the output
 
-- **Structural validity (authoritative):** run calibre's own "Check Book" validator — there is no standalone `epubcheck` installed, but `calibre-debug` exposes the same engine:
+- **Structural validity (authoritative):** run `epubcheck <out>.epub` if it is installed. If not, but calibre is, its "Check Book" engine is exposed via `calibre-debug`:
   ```bash
   calibre-debug -c "
   from calibre.ebooks.oeb.polish.check.main import run_checks
@@ -72,4 +72,4 @@ mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/convert_pymupdf.py "/pa
 - Check `dc:language`/`dc:title`/`dc:creator` in `EPUB/content.opf`.
 - Skim the `--keep-md` Markdown for leftover page numbers or broken paragraphs.
 - Deliver via Amazon Send to Kindle (EPUB is auto-converted; no AZW3 needed).
-- If a rendering complaint comes from testing on-device (e.g. Moon+ Reader on Android): check the actual generated CSS/XHTML first (`unzip -p <epub> EPUB/styles/*.css`) before assuming the pipeline is at fault — the reader's own settings (text alignment, "use publisher's style" toggle) are a common cause once the CSS itself checks out.
+- If a rendering complaint comes from testing on-device (any e-reader app, e.g. Moon+ Reader on Android): check the actual generated CSS/XHTML first (`unzip -p <epub> EPUB/styles/*.css`) before assuming the pipeline is at fault — the reader's own settings (text alignment, "use publisher's style" toggle) are a common cause once the CSS itself checks out.

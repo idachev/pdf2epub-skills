@@ -18,14 +18,20 @@ pdf2epub-skills/
 ├── README.md                                    # what the plugin does, install + CLI usage
 ├── LICENSE                                      # MIT
 ├── .claude-plugin/marketplace.json              # this repo is a Claude Code plugin marketplace
+├── .github/workflows/ci.yml                     # manifest validation + unit tests
 ├── plugins/pdf2epub/
 │   ├── .claude-plugin/plugin.json               # the single plugin this marketplace hosts
 │   └── skills/pdf2epub/
 │       ├── SKILL.md                             # skill definition Claude Code loads
 │       └── scripts/                             # convert_pymupdf.py, common.py, prompts/
+├── tests/                                       # offline unit tests for the pure pipeline stages
 ├── examples/                                    # sample PDF for local pipeline validation
 └── tmp/                                         # checkpoints and logs (not versioned)
 ```
+
+The plugin `version` lives only in `plugins/pdf2epub/.claude-plugin/plugin.json` (the marketplace entry deliberately has none, so it can't drift). The plugin description is duplicated in marketplace.json, plugin.json, and SKILL.md frontmatter — keep all three in sync when changing it.
+
+Run tests offline (no API key needed): `uvx pytest tests/ -q`
 
 ## Local validation
 
