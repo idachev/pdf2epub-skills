@@ -1,0 +1,15 @@
+# Scratch / working dirs (chunk checkpoints, build logs)
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Packaged skill archives
+*.skill
+
+# Local tool state
+.claude/settings.local.json
+.serena/
+*.log
