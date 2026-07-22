@@ -1,4 +1,4 @@
-"""Shared stages of the PDF-to-EPUB pipeline (see docs/plans/PDF_to_EPUB_Pipeline_Spec.md).
+"""Shared stages of the PDF-to-EPUB pipeline.
 
 Used by convert_pymupdf.py (local PyMuPDF4LLM extraction + Gemini cleanup).
 """
@@ -273,19 +273,21 @@ def extract_metadata(client, model: str, sample_text: str) -> tuple[str | None, 
         return None, None, None
 
 
-def _is_watermark_block(block: str, watermark_hosts: set[str]) -> bool:
-    bare = block.strip().strip("*_()[] \t")
+def _normalize_host(text: str) -> str:
+    bare = text.strip().strip("*_()[] \t")
     bare = re.sub(r"^(https?://)?(www\.)?", "", bare, flags=re.IGNORECASE).rstrip("/")
-    return bare.lower() in watermark_hosts
+    return bare.lower()
 
 
 def strip_watermarks(md: str, watermark_hosts: set[str]) -> str:
     """Drop paragraphs that are only a distributor watermark URL (e.g. a scan-site plug),
-    not part of the book's actual content."""
+    not part of the book's actual content. Hosts are matched scheme/www./case-insensitively,
+    so --strip-watermark accepts any of e.g. "site.com", "www.site.com", "http://site.com"."""
     if not watermark_hosts:
         return md
+    normalized_hosts = {_normalize_host(h) for h in watermark_hosts}
     blocks = re.split(r"\n\s*\n", md)
-    return "\n\n".join(b for b in blocks if not _is_watermark_block(b, watermark_hosts))
+    return "\n\n".join(b for b in blocks if _normalize_host(b) not in normalized_hosts)
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)

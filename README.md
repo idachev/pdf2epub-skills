@@ -11,7 +11,7 @@ It works with books in any language — title, author, and language are detected
 /plugin install pdf2epub@pdf2epub-skills
 ```
 
-Then ask Claude Code to convert a PDF, e.g. *"Convert books/my-book.pdf to EPUB"*, and it will invoke the `pdf2epub` skill.
+Then ask Claude Code to convert a PDF, e.g. *"Convert /path/to/my-book.pdf to EPUB"*, and it will invoke the `pdf2epub` skill.
 
 ## How it works
 
@@ -66,6 +66,7 @@ The EPUB lands next to the PDF as `<name>.epub`; `--keep-md` also keeps the comp
 plugins/pdf2epub/.claude-plugin/plugin.json       plugin manifest
 plugins/pdf2epub/skills/pdf2epub/SKILL.md         Claude Code skill definition
 plugins/pdf2epub/skills/pdf2epub/scripts/         converter (convert_pymupdf.py, common.py, prompts/)
+examples/                                         sample PDF for local pipeline validation
 tmp/                                              checkpoints and logs (not versioned)
 ```
 

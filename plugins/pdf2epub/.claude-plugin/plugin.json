@@ -5,5 +5,9 @@
   "author": {
     "name": "Ivan Dachev",
     "email": "i_dachev@yahoo.co.uk"
-  }
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/idachev/pdf2epub-skills",
+  "repository": "https://github.com/idachev/pdf2epub-skills",
+  "keywords": ["pdf", "epub", "ebook", "kindle", "gemini"]
 }

@@ -4,6 +4,7 @@
     "name": "Ivan Dachev",
     "email": "i_dachev@yahoo.co.uk"
   },
+  "description": "Convert text-based PDF books to clean, e-reader-ready EPUBs (local extraction + Gemini cleanup)",
   "plugins": [
     {
       "name": "pdf2epub",
