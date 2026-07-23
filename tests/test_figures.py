@@ -89,6 +89,56 @@ def test_render_and_redact_writes_png_and_strips_figure_text(tmp_path):
     assert "Body paragraph" in remaining          # prose above the figure kept
 
 
+def test_split_body_vs_labels():
+    long_para = (pymupdf.Rect(0, 0, 300, 40), "one two three four five six seven eight nine ten " * 3)
+    label = (pymupdf.Rect(0, 0, 40, 12), "Wisdom")
+    body, labels = figures._split_body_vs_labels([long_para, label])
+    assert len(body) == 1 and len(labels) == 1
+
+
+def _page_wide_figure_with_body():
+    """A full-width vector figure with a long narrative paragraph overlapping it plus a
+    short label — the side-by-side case (like the book's Kundalini page)."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=600)
+    for i in range(300):  # dense strokes across the whole width, lower half
+        x = 40 + (i % 30) * 11
+        y = 300 + (i // 30) * 11
+        page.draw_line((x, y), (x + 6, y + 6), width=0.4)
+    para = (
+        "This is a long narrative paragraph that flows beside the figure and must stay "
+        "reflowable body text in the EPUB instead of being baked into the rendered image."
+    )
+    page.insert_textbox(pymupdf.Rect(45, 305, 190, 560), para, fontsize=8)
+    page.insert_text((250, 360), "ShortLabel")
+    return doc
+
+
+def test_body_paragraph_kept_as_text_label_goes_to_image(tmp_path):
+    doc = _page_wide_figure_with_body()
+    refs = figures.render_and_redact(doc, tmp_path / "img", figures.FigureOptions())
+    assert refs.get(0), "the wide vector figure should still be captured"
+    text = doc[0].get_text()
+    assert "narrative paragraph" in text   # body prose preserved, not lost to the image
+    assert "ShortLabel" not in text        # short label moved into the image
+
+
+def test_background_fill_under_text_is_not_captured(tmp_path):
+    # a page of text sitting on a background fill (few draw ops) is not a figure
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=600)
+    page.draw_rect(pymupdf.Rect(20, 20, 380, 580), fill=(0, 0, 0))
+    page.insert_textbox(
+        pymupdf.Rect(40, 40, 360, 560),
+        "A full page of narrative prose sitting on a colored background rectangle. " * 5,
+        fontsize=9,
+        color=(1, 1, 1),
+    )
+    refs = figures.render_and_redact(doc, tmp_path / "img", figures.FigureOptions())
+    assert not refs.get(0)                       # skipped — it's a text page, not a diagram
+    assert "narrative prose" in doc[0].get_text()  # text preserved
+
+
 # ---------------------------------------------------------- book-gated integration
 
 _BOOK = os.environ.get("PDF2EPUB_TEST_BOOK")

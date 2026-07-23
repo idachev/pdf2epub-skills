@@ -218,19 +218,21 @@ pages 32/94/171; assert `EPUB/media/` figure count matches, calibre
 
 ## 8. Risks
 
-- **Runaway text absorption** pulling body text into a figure. `_absorb_text`
-  unions a text block's *whole* bbox on any overlap, so where PyMuPDF segments a
-  page into large multi-paragraph blocks a figure that merely grazes one could
-  swallow it in a single pass (the iteration cap bounds passes, not per-pass
-  size); the absorbed text becomes part of the image and is redacted from the
-  prose. On the reference book, blocks segment per-paragraph and body text does
-  not intersect the figure (≈6 pt gap), so this does not trigger — but it is the
-  main correctness risk for differently-typeset sources. Future guard: cap the
-  area a single absorption may add, or skip full-column body blocks.
-- **Same risk in `_merge_bands`**: it unions regions sharing a y-band with no
-  horizontal-gap bound, so two unrelated same-row figures (with prose between)
-  could merge into one composite whose text is redacted. Fine on the reference
-  book (one figure per band); a horizontal-gap bound is the future guard.
+- **Body text baked into a figure image.** A wide diagram (e.g. the book's
+  Kundalini page, whose dashed aura spans the full width) or a full-page fill can
+  make a figure region cover body paragraphs. Mitigated in `_plan_page` /
+  `render_and_redact`: text blocks inside a region are split by word count
+  (`_split_body_vs_labels`) — narrative prose (≥ `BODY_MIN_WORDS`) is kept as
+  reflowable EPUB text and *blanked from the rendered image* (rendered from a
+  scratch page with those glyphs redacted), while short labels stay in the image
+  and are removed from the text. Residual risk: a genuinely long in-figure
+  annotation (≥ `BODY_MIN_WORDS`) is treated as prose (pulled out of the image);
+  a very short caption is treated as a label (kept in the image, not searchable).
+- **Text page misread as a figure.** A page of text on a background fill (a back
+  cover) has almost no vector ink. `_plan_page` drops any region with fewer than
+  `MIN_FIG_DRAW_OPS` vector ops and no raster, so it stays as text. Measured
+  separation on the reference book is wide (3 ops for the back cover vs 300–6000
+  for real figures).
 - **Over/under-detection** of vector figures on other books. Mitigation:
   `--figure-min-cells` / `--image-min-px` / `--image-max-aspect` knobs; log each
   detected region's page and size so a user can re-tune and rerun. The workdir
