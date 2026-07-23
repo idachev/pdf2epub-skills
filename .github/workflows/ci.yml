@@ -17,4 +17,5 @@ jobs:
           python3 -m json.tool plugins/pdf2epub/.claude-plugin/plugin.json > /dev/null
       - name: Run unit tests
         # pin the interpreter: common.py uses PEP 604 unions, which need Python >= 3.10
-        run: uvx --python 3.12 pytest tests/ -q
+        # pymupdf: figure-detection tests build synthetic PDFs in-memory
+        run: uvx --python 3.12 --with pymupdf pytest tests/ -q

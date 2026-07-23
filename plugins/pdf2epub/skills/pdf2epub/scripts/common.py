@@ -62,6 +62,28 @@ def base_arg_parser(parser_name: str) -> argparse.ArgumentParser:
         help="Domain (e.g. scan-site.com) whose standalone-URL paragraphs should be dropped "
         "as distributor watermarks; repeatable",
     )
+    p.add_argument(
+        "--images",
+        choices=["auto", "off"],
+        default="auto",
+        help="Capture figures/diagrams as images (auto, default) or skip them entirely (off)",
+    )
+    p.add_argument(
+        "--image-min-px", type=int, default=128,
+        help="Min smaller-dimension (px) of a raster image to keep as a figure (default: 128)",
+    )
+    p.add_argument(
+        "--image-max-aspect", type=float, default=6.0,
+        help="Max width:height (or inverse) of a raster image to keep (default: 6)",
+    )
+    p.add_argument(
+        "--figure-min-cells", type=int, default=120,
+        help="Min covered grid cells for a vector cluster to count as a figure (default: 120)",
+    )
+    p.add_argument(
+        "--figure-dpi", type=int, default=150,
+        help="Render resolution for captured figure images (default: 150)",
+    )
     return p
 
 
@@ -195,10 +217,15 @@ def merge_split_paragraphs(blocks: list[str]) -> list[str]:
     """Rejoin paragraphs split by page breaks before chunking (Stage 1 requirement)."""
     merged: list[str] = []
     for block in blocks:
-        if merged and not block.startswith("#"):
+        if merged and not block.startswith("#") and not block.startswith("!["):
             prev = merged[-1].rstrip()
             first = block.lstrip()[:1]
-            if not merged[-1].startswith("#") and not prev.endswith(_TERMINAL_PUNCT) and first.islower():
+            if (
+                not merged[-1].startswith("#")
+                and not merged[-1].startswith("![")
+                and not prev.endswith(_TERMINAL_PUNCT)
+                and first.islower()
+            ):
                 if prev.endswith("-"):
                     merged[-1] = prev[:-1] + block.lstrip()
                 else:
@@ -228,6 +255,54 @@ def chunk_markdown(md: str, target_words: int = TARGET_CHUNK_WORDS) -> list[str]
 
 
 # ----------------------------------------- Stage 2: LLM cleanup with checkpoints
+
+_IMAGE_BLOCK_RE = re.compile(r"\s*!\[[^\]]*\]\([^)]*\)\s*")
+
+
+def _is_image_block(block: str) -> bool:
+    """True if the block is only a Markdown image reference (optionally padded)."""
+    return bool(_IMAGE_BLOCK_RE.fullmatch(block))
+
+
+def _clean_body(
+    client, model: str, chunk: str, prompt: str, temperature: float = 0.1
+) -> tuple[str, int, int]:
+    """Clean a chunk's prose while passing image-ref blocks through verbatim.
+
+    Image references must never reach the model (it would reword or drop them)
+    and must not count toward the fidelity ratio (a figure-dense chunk would
+    otherwise look like it lost content). Returns (cleaned, src_words, out_words)
+    counting only the non-image text. A chunk with no image refs takes the exact
+    same single-call path as before.
+    """
+    if not _IMAGE_BLOCK_RE.search(chunk):
+        out = _clean_text(client, model, chunk, prompt, temperature)
+        return out, len(chunk.split()), len(out.split())
+
+    blocks = [b for b in re.split(r"\n\s*\n", chunk) if b.strip()]
+    out_parts: list[str] = []
+    src_words = out_words = 0
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal src_words, out_words, buffer
+        if not buffer:
+            return
+        seg = "\n\n".join(buffer)
+        cleaned = _clean_text(client, model, seg, prompt, temperature)
+        out_parts.append(cleaned)
+        src_words += len(seg.split())
+        out_words += len(cleaned.split())
+        buffer = []
+
+    for block in blocks:
+        if _is_image_block(block):
+            flush()
+            out_parts.append(block.strip())
+        else:
+            buffer.append(block)
+    flush()
+    return "\n\n".join(out_parts), src_words, out_words
 
 
 def _clean_text(client, model: str, text: str, prompt: str, temperature: float = 0.1) -> str:
@@ -291,8 +366,8 @@ def clean_chunks(
                     "source text fully and exactly; remove only layout artifacts."
                 )
                 temperature = 0.4
-            out = _clean_text(client, model, chunk, attempt_prompt, temperature)
-            ratio = len(out.split()) / max(1, len(chunk.split()))
+            out, src_words, out_words = _clean_body(client, model, chunk, attempt_prompt, temperature)
+            ratio = out_words / max(1, src_words)
             if FIDELITY_BOUNDS[0] <= ratio <= FIDELITY_BOUNDS[1]:
                 break
             print(
@@ -443,13 +518,15 @@ def build_frontmatter(title: str, author: str, language: str) -> str:
     return f'---\ntitle: "{esc(title)}"\nauthor: "{esc(author)}"\nlang: "{esc(language)}"\n---\n\n'
 
 
-def compile_epub(md_path: Path, epub_path: Path) -> None:
+def compile_epub(md_path: Path, epub_path: Path, resource_path: Path | None = None) -> None:
     if not shutil.which("pandoc"):
         sys.exit("error: pandoc not found on PATH")
-    subprocess.run(
-        ["pandoc", str(md_path), "-o", str(epub_path), "--toc", "--split-level=2", "--quiet"],
-        check=True,
-    )
+    cmd = ["pandoc", str(md_path), "-o", str(epub_path), "--toc", "--split-level=2", "--quiet"]
+    if resource_path is not None:
+        # so relative image refs (images/fig-….png) resolve regardless of CWD;
+        # pandoc then bundles them into EPUB/media/ automatically
+        cmd.append(f"--resource-path={resource_path}")
+    subprocess.run(cmd, check=True)
 
 
 def finalize(args: argparse.Namespace, wd: Path, cleaned_chunks: list[str], client) -> None:
@@ -473,10 +550,14 @@ def finalize(args: argparse.Namespace, wd: Path, cleaned_chunks: list[str], clie
     atomic_write(md_path, build_frontmatter(title, author, language) + body)
     epub_path = args.output or args.input_pdf.parent / f"{args.input_pdf.stem}.epub"
     epub_path.parent.mkdir(parents=True, exist_ok=True)
-    compile_epub(md_path, epub_path)
+    compile_epub(md_path, epub_path, resource_path=wd)
     if args.keep_md:
         kept = epub_path.with_suffix(".md")
         shutil.copy(md_path, kept)
+        images_src = wd / "images"
+        if images_src.is_dir():
+            # copy figures next to the kept Markdown so its refs resolve for the user too
+            shutil.copytree(images_src, kept.parent / "images", dirs_exist_ok=True)
         print(f"markdown: {kept}")
     language_display = f"{language} ({language_name})" if language_name else language
     print(f"title: {title}\nauthor: {author}\nlanguage: {language_display}\nepub: {epub_path}")

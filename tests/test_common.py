@@ -148,6 +148,49 @@ def test_clean_text_passes_through_when_nothing_blocked(monkeypatch):
     assert common._clean_text(None, "model", "anything", "prompt") == "cleaned"
 
 
+# --------------------------------------------------- image-ref protection in cleanup
+
+
+def test_is_image_block():
+    assert common._is_image_block("![](images/fig-0001-00.png)")
+    assert common._is_image_block("  ![alt text](x.png)  \n")
+    assert not common._is_image_block("prose with ![](a.png) inline")
+    assert not common._is_image_block("just text")
+
+
+def test_clean_body_no_image_is_single_pass(monkeypatch):
+    calls = []
+
+    def fake(client, model, text, prompt, temperature=0.1):
+        calls.append(text)
+        return text
+
+    monkeypatch.setattr(common, "_clean_text", fake)
+    out, src, dst = common._clean_body(None, "m", "a b c", "prompt")
+    assert out == "a b c" and src == 3 and dst == 3
+    assert len(calls) == 1  # whole chunk cleaned in one call, exactly as before
+
+
+def test_clean_body_passes_image_blocks_through_and_excludes_from_ratio(monkeypatch):
+    monkeypatch.setattr(
+        common, "_clean_text", lambda client, model, text, prompt, temperature=0.1: text.upper()
+    )
+    chunk = "hello world\n\n![](images/fig-0001-00.png)\n\nmore text here"
+    out, src, dst = common._clean_body(None, "m", chunk, "prompt")
+    assert "![](images/fig-0001-00.png)" in out       # ref survives verbatim
+    assert "HELLO WORLD" in out and "MORE TEXT HERE" in out
+    assert src == 5 and dst == 5                        # image words not counted
+
+
+def test_merge_split_paragraphs_never_merges_image_ref():
+    # image ref followed by lowercase text must not be glued into one block
+    blocks = ["![](images/x.png)", "continues lowercase across a page break"]
+    assert common.merge_split_paragraphs(blocks) == blocks
+    # text with no terminal punctuation followed by an image ref stays separate
+    blocks2 = ["a dangling clause without punctuation", "![](images/x.png)"]
+    assert common.merge_split_paragraphs(blocks2) == blocks2
+
+
 # ------------------------------------------------------- assign_ascii_heading_ids
 
 
