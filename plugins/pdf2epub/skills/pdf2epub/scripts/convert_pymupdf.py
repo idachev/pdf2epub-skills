@@ -27,10 +27,16 @@ def extract_markdown(pdf: Path, cache: Path, images_dir: Path, opts) -> str:
     if opts is None:
         md = pymupdf4llm.to_markdown(str(pdf))
     else:
+        import shutil
+
         import pymupdf
 
         import figures
 
+        # fresh extraction (cache miss): drop any images from a prior/aborted run so the
+        # folder only ever holds figures referenced by this extraction
+        if images_dir.exists():
+            shutil.rmtree(images_dir)
         doc = pymupdf.open(str(pdf))
         refs = figures.render_and_redact(doc, images_dir, opts, log=print)
         n_figs = sum(len(v) for v in refs.values())
