@@ -59,14 +59,50 @@ The EPUB lands next to the PDF as `<name>.epub`; `--keep-md` also keeps the comp
 - **Rate limits** — API calls retry with exponential backoff; each parallel worker backs off independently.
 - **ASCII heading ids** — headings get explicit `{#sec-NNNN}` ids injected before compiling, so EPUB validators don't flag non-Latin-script (Cyrillic, CJK, etc.) heading text turned into invalid ids.
 
+## Testing
+
+Run the suite with `pytest`, giving `uv` the one runtime dep the tests import
+(`pymupdf`); pin Python ≥ 3.10 because the code uses PEP 604 unions:
+
+```bash
+uvx --python 3.12 --with pymupdf pytest tests/ -q
+```
+
+This is exactly what CI runs. No `GEMINI_API_KEY` or network is needed — every
+Gemini call is monkeypatched, and the figure tests build/read local PDFs only.
+
+- **Unit tests** (`tests/test_common.py`, `tests/test_figures.py`) cover the pure
+  pipeline stages: chunking, watermark stripping, image-ref protection, the
+  fidelity-ratio edge cases, and figure detection/redaction on synthetic PDFs
+  built in-memory with PyMuPDF.
+- **Fixture integration test** (`tests/test_sample_pdf.py`) runs the full
+  detect → render → redact path against a committed, license-clean fixture,
+  `tests/fixtures/sample_diagrams.pdf`. The fixture is authored entirely in code
+  by `tests/fixtures/make_sample.py` (no third-party content) and covers the
+  tricky layouts: a clean labelled diagram, a wide diagram with a body paragraph
+  wrapped beside it, a text page on a background fill (a "back cover" that must
+  stay text, not become an image), and a plain prose page. It asserts figures are
+  captured only on the diagram pages, that narrative prose is preserved as
+  reflowable text while short labels move into the image, and that the fill/text
+  pages are left alone. This test always runs, CI included. Regenerate the fixture
+  after changing the generator with `uv run tests/fixtures/make_sample.py`.
+- **Book-gated test** (in `tests/test_figures.py`) is an *optional* extra check
+  against a real book. It is skipped unless `PDF2EPUB_TEST_BOOK` points at a local
+  PDF, so it never runs in CI:
+
+  ```bash
+  PDF2EPUB_TEST_BOOK="/path/to/book.pdf" uvx --python 3.12 --with pymupdf pytest tests/ -q
+  ```
+
 ## Repository layout
 
 ```
 .claude-plugin/marketplace.json                  marketplace manifest
 plugins/pdf2epub/.claude-plugin/plugin.json       plugin manifest
 plugins/pdf2epub/skills/pdf2epub/SKILL.md         Claude Code skill definition
-plugins/pdf2epub/skills/pdf2epub/scripts/         converter (convert_pymupdf.py, common.py, prompts/)
-examples/                                         sample PDF for local pipeline validation
+plugins/pdf2epub/skills/pdf2epub/scripts/         converter (convert_pymupdf.py, common.py, figures.py, prompts/)
+docs/specs/                                       design specs (e.g. image-preservation.md)
+tests/                                            pytest suite + fixtures/ (sample_diagrams.pdf, make_sample.py)
 tmp/                                              checkpoints and logs (not versioned)
 ```
 
