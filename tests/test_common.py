@@ -295,3 +295,23 @@ def test_frontmatter_escapes_quotes_backslashes_and_newlines():
     assert 'title: "He said \\"hi\\" again"' in fm
     assert 'author: "A\\\\B"' in fm
     assert fm.count("\n---\n") == 1
+
+
+# ------------------------------------------------------------------------- slugify
+
+
+def test_slugify_lowercases_and_collapses_punctuation_to_hyphens():
+    name = "The Catalyst of Power: The Assemblage Point of Man"
+    assert common.slugify(name) == "the-catalyst-of-power-the-assemblage-point-of-man"
+
+
+def test_slugify_strips_leading_and_trailing_separators():
+    assert common.slugify("  --Weird Name--  ") == "weird-name"
+
+
+def test_slugify_keeps_non_latin_letters():
+    assert common.slugify("Радиестезия") == "радиестезия"
+
+
+def test_slugify_empty_result_falls_back_to_book():
+    assert common.slugify("...") == "book"

@@ -557,6 +557,15 @@ def assign_ascii_heading_ids(md: str) -> str:
     return result + "\n" if md.endswith("\n") else result
 
 
+def slugify(name: str) -> str:
+    """Normalize a book name into a filesystem-safe path segment: lowercase, runs of
+    whitespace/punctuation collapsed to a single hyphen. Used to namespace a kept
+    Markdown's images/ folder so multiple books in the same output directory don't
+    collide (figure filenames are page-based, e.g. fig-0039-00.png, and repeat per book)."""
+    slug = re.sub(r"[^\w]+", "-", name.strip().lower(), flags=re.UNICODE).strip("-_")
+    return slug or "book"
+
+
 def build_frontmatter(title: str, author: str, language: str) -> str:
     # collapse newlines first (a multi-line value would break the single-line
     # double-quoted YAML scalar), then escape for the double quotes
@@ -600,11 +609,16 @@ def finalize(args: argparse.Namespace, wd: Path, cleaned_chunks: list[str], clie
     compile_epub(md_path, epub_path, resource_path=wd)
     if args.keep_md:
         kept = epub_path.with_suffix(".md")
-        shutil.copy(md_path, kept)
         images_src = wd / "images"
         if images_src.is_dir():
-            # copy figures next to the kept Markdown so its refs resolve for the user too
-            shutil.copytree(images_src, kept.parent / "images", dirs_exist_ok=True)
+            # copy figures next to the kept Markdown so its refs resolve for the user too;
+            # namespaced per book so two books' images/ don't collide in the same folder
+            slug = slugify(epub_path.stem)
+            shutil.copytree(images_src, kept.parent / "images" / slug, dirs_exist_ok=True)
+            kept_text = md_path.read_text(encoding="utf-8").replace("](images/", f"](images/{slug}/")
+            atomic_write(kept, kept_text)
+        else:
+            shutil.copy(md_path, kept)
         print(f"markdown: {kept}")
     language_display = f"{language} ({language_name})" if language_name else language
     print(f"title: {title}\nauthor: {author}\nlanguage: {language_display}\nepub: {epub_path}")
