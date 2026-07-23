@@ -109,6 +109,45 @@ def test_no_hosts_is_a_no_op():
     assert common.strip_watermarks(md, set()) == md
 
 
+def test_drops_watermark_url_with_path():
+    md = "real paragraph\n\nhttps://scan-site.com/book/12345\n\nanother paragraph"
+    out = common.strip_watermarks(md, {"scan-site.com"})
+    assert "scan-site.com" not in out
+    assert "real paragraph" in out and "another paragraph" in out
+
+
+def test_keeps_sentence_mentioning_watermark_host():
+    md = "Find more books at scan-site.com if you like.\n\nreal paragraph"
+    out = common.strip_watermarks(md, {"scan-site.com"})
+    assert "Find more books at scan-site.com if you like." in out
+
+
+def test_does_not_drop_lookalike_host():
+    md = "a\n\nhttps://not-scan-site.com/\n\nb"
+    out = common.strip_watermarks(md, {"scan-site.com"})
+    assert "not-scan-site.com" in out
+
+
+# ----------------------------------------------------------------- _clean_text
+
+
+def test_clean_text_bisects_blocked_chunks_and_keeps_blocked_paragraph_verbatim(monkeypatch):
+    def fake_generate(client, model, contents, system_instruction, temperature=0.1, **kwargs):
+        if "FORBIDDEN" in contents:
+            raise common.PromptBlockedError("SAFETY")
+        return contents.lower()
+
+    monkeypatch.setattr(common, "generate", fake_generate)
+    text = "GOOD ONE\n\nFORBIDDEN PARA\n\nGOOD TWO"
+    out = common._clean_text(None, "model", text, "prompt")
+    assert out == "good one\n\nFORBIDDEN PARA\n\ngood two"
+
+
+def test_clean_text_passes_through_when_nothing_blocked(monkeypatch):
+    monkeypatch.setattr(common, "generate", lambda *a, **k: "cleaned")
+    assert common._clean_text(None, "model", "anything", "prompt") == "cleaned"
+
+
 # ------------------------------------------------------- assign_ascii_heading_ids
 
 

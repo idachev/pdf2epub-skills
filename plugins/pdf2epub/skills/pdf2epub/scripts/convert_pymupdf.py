@@ -19,11 +19,12 @@ def extract_markdown(pdf: Path, cache: Path) -> str:
     import pymupdf4llm
 
     md = pymupdf4llm.to_markdown(str(pdf))
-    cache.write_text(md, encoding="utf-8")
+    common.atomic_write(cache, md)
     return md
 
 
 def main() -> None:
+    common.setup_output()
     args = common.base_arg_parser(PARSER).parse_args()
     wd = common.work_dir(args, PARSER)
     md = extract_markdown(args.input_pdf, wd / "extracted.md")
@@ -33,7 +34,7 @@ def main() -> None:
     cleaned = common.clean_chunks(
         client, args.model, chunks, wd / "chunks", args.max_chunks, args.concurrency
     )
-    common.finalize(args, PARSER, cleaned, client)
+    common.finalize(args, wd, cleaned, client)
 
 
 if __name__ == "__main__":

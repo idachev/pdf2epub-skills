@@ -9,7 +9,7 @@ Pipeline: local Markdown extraction (PyMuPDF4LLM) → chunking at paragraph boun
 
 ## Requirements
 
-- `GEMINI_API_KEY` environment variable (verify with `[ -n "$GEMINI_API_KEY" ]` — never print it).
+- `GEMINI_API_KEY` environment variable (`GOOGLE_API_KEY` works as an alternative; verify with `[ -n "$GEMINI_API_KEY" ]` — never print it).
 - `uv` and `pandoc` on PATH. Dependencies are declared inline (PEP 723); `uv run` resolves them automatically.
 
 ## Usage
@@ -45,7 +45,7 @@ mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/convert_pymupdf.py "/pa
 - **Fidelity check:** each cleaned chunk must keep a 0.70–1.20 output/input word ratio; one retry, then the run aborts loudly. Inspect the offending chunk in the checkpoint dir.
 - **Safety-filter blocks:** Gemini's input filter (and output-side `finish_reason` blocks like `SAFETY`/`RECITATION`) rejects chunks combining the book's title+author with body text. The pipeline auto-bisects blocked chunks and keeps still-blocked single paragraphs verbatim — warnings appear on stderr; this is expected for chunk 1.
 - **Watermark stripping:** pass one or more `--strip-watermark HOST` flags for domains found in the source scan (e.g. a distributor site plugging itself in a standalone paragraph); `strip_watermarks()` (Stage 3) then deterministically drops paragraphs that are only that URL. The cleanup prompt also asks the LLM to strip obvious scan-site watermarks heuristically, but the deterministic pass is the actual guarantee — use it whenever a book's source PDF carries a known watermark domain.
-- **Language/metadata auto-detection:** if `--title`/`--author`/`--language` aren't all given, the pipeline sends the first cleaned chunk to Gemini to fill in whatever's missing (title/author kept in the book's original language; language as a BCP-47 code). Override any of the three explicitly to skip detection for that field.
+- **Language/metadata auto-detection:** if `--title`/`--author`/`--language` aren't all given, the pipeline sends the first cleaned chunk to Gemini to fill in whatever's missing (title/author kept in the book's original language; language as a BCP-47 code). Override any of the three explicitly to skip detection for that field. The model is asked for the full language name ("Italian") before the code ("it") — a bare code is ambiguous to an LLM — and the final summary prints both (`language: it (Italian)`); check that line to confirm detection got the right language.
 - **ASCII heading ids:** pandoc's EPUB writer slugifies each heading's own text into its section `id`, which is invalid (non-ASCII) for non-Latin-script headings (Cyrillic, CJK, etc.) per strict EPUB id validation. `assign_ascii_heading_ids()` (Stage 3) injects explicit `{#sec-NNNN}` header attributes into the compiled Markdown before compiling, so ids are always ASCII regardless of the book's script; pandoc's own nav/TOC generation picks these up automatically.
 - **Cost:** a ~100-page book ≈ 28 chunks ≈ 0.60 USD with gemini-3.5-flash. Smoke-test with `--max-chunks 2` first when iterating on prompts. (Do not write a dollar sign followed by a digit in this file — skill argument substitution mangles it.)
 - Prompt changes: edit `scripts/prompts/clean_chunk.md` (cleanup rules) or `extract_metadata.md`; after changing prompts, delete cached chunks or they will mask the change.
@@ -70,6 +70,6 @@ mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/convert_pymupdf.py "/pa
   ```
   Expect `warn_count: 0` (the ASCII-id fix above clears the "Invalid id" warnings this used to report). A baseline ~30-70 `ERROR`-level findings are expected and harmless — they're pandoc's own default EPUB template boilerplate (empty CSS placeholders like `h1.title { }`, selector-ordering nitpicks), not something this pipeline introduces. Don't use a list/dict comprehension referencing an outer variable in `calibre-debug -c` scripts — its exec scoping breaks closures; use a plain `for` loop instead.
 - Check `dc:language`/`dc:title`/`dc:creator` in `EPUB/content.opf`.
-- Skim the `--keep-md` Markdown for leftover page numbers or broken paragraphs.
+- Skim the `--keep-md` Markdown for leftover page numbers or broken paragraphs. Check the title page especially for displaced drop-cap letters (e.g. `HIRD EDITION (T )`) — decorative typesetting is where extraction most often mangles text; the cleanup prompt repairs the obvious cases, but a decorated title page can still slip through.
 - Deliver via Amazon Send to Kindle (EPUB is auto-converted; no AZW3 needed).
 - If a rendering complaint comes from testing on-device (any e-reader app, e.g. Moon+ Reader on Android): check the actual generated CSS/XHTML first (`unzip -p <epub> EPUB/styles/*.css`) before assuming the pipeline is at fault — the reader's own settings (text alignment, "use publisher's style" toggle) are a common cause once the CSS itself checks out.

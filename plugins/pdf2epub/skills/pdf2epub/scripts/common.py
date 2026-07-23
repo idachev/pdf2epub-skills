@@ -25,10 +25,13 @@ DEFAULT_LANGUAGE = "en"
 # ---------------------------------------------------------------- CLI / paths
 
 
-def base_arg_parser(parser_name: str) -> argparse.ArgumentParser:
-    # progress must reach redirected log files immediately, not sit in the block buffer
+def setup_output() -> None:
+    """Progress must reach redirected log files immediately, not sit in the block buffer."""
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
+
+
+def base_arg_parser(parser_name: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=f"PDF-to-EPUB converter ({parser_name} parser)")
     p.add_argument("input_pdf", type=Path, help="Source PDF file")
     p.add_argument("-o", "--output", type=Path, help="Destination EPUB path")
@@ -92,7 +95,7 @@ def atomic_write(path: Path, text: str) -> None:
 
 def get_client():
     if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
-        sys.exit("error: GEMINI_API_KEY is not set")
+        sys.exit("error: neither GEMINI_API_KEY nor GOOGLE_API_KEY is set")
     from google import genai
 
     return genai.Client()
@@ -304,14 +307,23 @@ def clean_chunks(
         return out
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = [pool.submit(clean_one, item) for item in enumerate(todo, 1)]
         try:
-            return list(pool.map(clean_one, enumerate(todo, 1)))
+            return [f.result() for f in futures]
         except RuntimeError as e:
+            # cancel queued chunks: without this the with-block's shutdown(wait=True)
+            # would run — and pay for — every remaining Gemini call before exiting
+            pool.shutdown(cancel_futures=True)
             sys.exit(f"error: {e}")
         except errors.APIError as e:
             # non-retryable API failure (e.g. invalid key, quota exhausted) raised in a
             # worker thread — exit cleanly instead of dumping a multi-thread traceback
+            pool.shutdown(cancel_futures=True)
             sys.exit(f"error: Gemini API call failed: {e}")
+        except SystemExit:
+            # generate() gave up after max_retries inside a worker
+            pool.shutdown(cancel_futures=True)
+            raise
 
 
 # --------------------------------------- Stage 3 + 4: metadata, compile, output
@@ -336,7 +348,14 @@ def validate_language(value) -> str | None:
     return None
 
 
-def extract_metadata(client, model: str, sample_text: str) -> tuple[str | None, str | None, str | None]:
+def extract_metadata(
+    client, model: str, sample_text: str
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Returns (title, author, language_code, language_name). The prompt asks for the
+    full language name before the BCP-47 code: a bare code like "it" is ambiguous to
+    an LLM (Italian? the pronoun?), so the model commits to the language in words
+    first and derives the code from that. The code goes into the EPUB (dc:language
+    must be BCP-47); the name is for humans and any future LLM-facing instruction."""
     from google.genai import errors
 
     try:
@@ -345,10 +364,11 @@ def extract_metadata(client, model: str, sample_text: str) -> tuple[str | None, 
         title = _single_line(data.get("title"))
         author = _single_line(data.get("author"))
         language = validate_language(data.get("language"))
-        return title, author, language
+        language_name = _single_line(data.get("language_name"))
+        return title, author, language, language_name
     except (PromptBlockedError, json.JSONDecodeError, AttributeError, errors.APIError) as e:
         print(f"  warning: metadata extraction failed ({e}); using fallbacks", file=sys.stderr)
-        return None, None, None
+        return None, None, None, None
 
 
 def _normalize_host(text: str) -> str:
@@ -360,12 +380,21 @@ def _normalize_host(text: str) -> str:
 def strip_watermarks(md: str, watermark_hosts: set[str]) -> str:
     """Drop paragraphs that are only a distributor watermark URL (e.g. a scan-site plug),
     not part of the book's actual content. Hosts are matched scheme/www./case-insensitively,
-    so --strip-watermark accepts any of e.g. "site.com", "www.site.com", "http://site.com"."""
+    so --strip-watermark accepts any of e.g. "site.com", "www.site.com", "http://site.com";
+    a URL carrying a path (site.com/book/123) counts too. A paragraph with whitespace is
+    never dropped — a real sentence mentioning the site is book content, not a watermark."""
     if not watermark_hosts:
         return md
     normalized_hosts = {_normalize_host(h) for h in watermark_hosts}
+
+    def is_watermark(block: str) -> bool:
+        bare = _normalize_host(block)
+        if any(c.isspace() for c in bare):
+            return False
+        return any(bare == h or bare.startswith(h + "/") for h in normalized_hosts)
+
     blocks = re.split(r"\n\s*\n", md)
-    return "\n\n".join(b for b in blocks if _normalize_host(b) not in normalized_hosts)
+    return "\n\n".join(b for b in blocks if not is_watermark(b))
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$")
@@ -423,23 +452,25 @@ def compile_epub(md_path: Path, epub_path: Path) -> None:
     )
 
 
-def finalize(args: argparse.Namespace, parser_name: str, cleaned_chunks: list[str], client) -> None:
-    """Stage 3 (metadata + concatenation) and Stage 4 (pandoc compile)."""
+def finalize(args: argparse.Namespace, wd: Path, cleaned_chunks: list[str], client) -> None:
+    """Stage 3 (metadata + concatenation) and Stage 4 (pandoc compile).
+    `wd` is the checkpoint dir already computed by the caller (work_dir() hashes the
+    whole PDF, so recomputing it here would read the file a second time)."""
     if not cleaned_chunks:
         sys.exit("error: no cleaned chunks to compile")
     title, author, language = args.title, args.author, args.language
+    language_name = None
     if not (title and author and language):
-        found_title, found_author, found_language = extract_metadata(client, args.model, cleaned_chunks[0])
+        found_title, found_author, found_language, language_name = extract_metadata(
+            client, args.model, cleaned_chunks[0]
+        )
         title = title or found_title or args.input_pdf.stem
         author = author or found_author or "Unknown"
         language = language or found_language or DEFAULT_LANGUAGE
-    md_path = work_dir(args, parser_name) / "compiled_book.md"
+    md_path = wd / "compiled_book.md"
     body = strip_watermarks("\n\n".join(cleaned_chunks), set(args.strip_watermark))
     body = assign_ascii_heading_ids(body)
-    md_path.write_text(
-        build_frontmatter(title, author, language) + body,
-        encoding="utf-8",
-    )
+    atomic_write(md_path, build_frontmatter(title, author, language) + body)
     epub_path = args.output or args.input_pdf.parent / f"{args.input_pdf.stem}.epub"
     epub_path.parent.mkdir(parents=True, exist_ok=True)
     compile_epub(md_path, epub_path)
@@ -447,4 +478,5 @@ def finalize(args: argparse.Namespace, parser_name: str, cleaned_chunks: list[st
         kept = epub_path.with_suffix(".md")
         shutil.copy(md_path, kept)
         print(f"markdown: {kept}")
-    print(f"title: {title}\nauthor: {author}\nlanguage: {language}\nepub: {epub_path}")
+    language_display = f"{language} ({language_name})" if language_name else language
+    print(f"title: {title}\nauthor: {author}\nlanguage: {language_display}\nepub: {epub_path}")
