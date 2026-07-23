@@ -182,6 +182,38 @@ def test_clean_body_passes_image_blocks_through_and_excludes_from_ratio(monkeypa
     assert src == 5 and dst == 5                        # image words not counted
 
 
+def test_image_options_signature_distinguishes_settings():
+    import argparse
+
+    def ns(**kw):
+        base = dict(images="auto", image_min_px=128, image_max_aspect=6.0, figure_min_cells=120, figure_dpi=150)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    off = common._image_options_signature(ns(images="off"))
+    auto = common._image_options_signature(ns())
+    assert off == "img=off"
+    assert auto != off
+    # a changed tuning flag yields a different signature (so the workdir key changes)
+    assert common._image_options_signature(ns(figure_min_cells=40)) != auto
+    assert common._image_options_signature(ns(image_min_px=64)) != auto
+    # identical settings are stable
+    assert common._image_options_signature(ns()) == auto
+
+
+def test_clean_body_image_only_chunk_has_no_prose_words(monkeypatch):
+    # an image-only chunk must report zero source words so the caller can skip the
+    # fidelity ratio instead of aborting on 0/0
+    def boom(*a, **k):
+        raise AssertionError("image-only chunk must not be sent to the model")
+
+    monkeypatch.setattr(common, "_clean_text", boom)
+    chunk = "![](images/fig-0001-00.png)\n\n![](images/fig-0001-01.png)"
+    out, src, dst = common._clean_body(None, "m", chunk, "prompt")
+    assert src == 0 and dst == 0
+    assert out == chunk
+
+
 def test_merge_split_paragraphs_never_merges_image_ref():
     # image ref followed by lowercase text must not be glued into one block
     blocks = ["![](images/x.png)", "continues lowercase across a page break"]

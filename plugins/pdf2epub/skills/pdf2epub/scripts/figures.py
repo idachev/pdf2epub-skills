@@ -165,25 +165,31 @@ def render_and_redact(doc, images_dir, opts, log=lambda _m: None):
     pymupdf4llm's later text pass does not re-emit the figure's label/caption
     text. Returns {page_index: [png_filename, ...]} in reading order.
     """
+    import pymupdf
+
     images_dir = Path(images_dir)
     images_dir.mkdir(parents=True, exist_ok=True)
     refs = {}
     for pno in range(len(doc)):
         page = doc[pno]
-        figs = detect_figure_regions(page, doc, opts)
-        if not figs:
-            continue
-        names = []
-        for k, rect in enumerate(figs):
-            page.get_pixmap(clip=rect, dpi=opts.dpi).save(str(images_dir / f"fig-{pno + 1:04d}-{k:02d}.png"))
-            names.append(f"fig-{pno + 1:04d}-{k:02d}.png")
-            page.add_redact_annot(rect)
-            log(f"  figure fig-{pno + 1:04d}-{k:02d}.png: {round(rect.width)}x{round(rect.height)}pt on page {pno + 1}")
-        # graphics=2 (REMOVE_IF_TOUCHED): strip every vector stroke of the figure,
-        # not just those fully covered — otherwise leftover line art makes
-        # pymupdf4llm rasterize+OCR the region (slow, and needs Tesseract).
-        import pymupdf
-
-        page.apply_redactions(graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
-        refs[pno] = names
+        # isolate per-page failures: a single malformed page must not abort the
+        # whole book's extraction (which runs before any Gemini call). That page
+        # just falls back to text-only.
+        try:
+            figs = detect_figure_regions(page, doc, opts)
+            if not figs:
+                continue
+            names = []
+            for k, rect in enumerate(figs):
+                page.get_pixmap(clip=rect, dpi=opts.dpi).save(str(images_dir / f"fig-{pno + 1:04d}-{k:02d}.png"))
+                names.append(f"fig-{pno + 1:04d}-{k:02d}.png")
+                page.add_redact_annot(rect)
+                log(f"  figure fig-{pno + 1:04d}-{k:02d}.png: {round(rect.width)}x{round(rect.height)}pt on page {pno + 1}")
+            # graphics=2 (REMOVE_IF_TOUCHED): strip every vector stroke of the figure,
+            # not just those fully covered — otherwise leftover line art makes
+            # pymupdf4llm rasterize+OCR the region (slow, and needs Tesseract).
+            page.apply_redactions(graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED)
+            refs[pno] = names
+        except Exception as e:  # noqa: BLE001 — resilience: skip figures on a bad page
+            log(f"  warning: skipping figures on page {pno + 1} ({type(e).__name__}: {e})")
     return refs

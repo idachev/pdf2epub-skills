@@ -87,15 +87,32 @@ def base_arg_parser(parser_name: str) -> argparse.ArgumentParser:
     return p
 
 
+def _image_options_signature(args: argparse.Namespace) -> str:
+    """A short signature of the options that change what stage-1 extraction produces
+    (which figures are detected, hence the Markdown's image refs). Folded into the
+    workdir key so `--images`/figure-tuning reruns don't silently reuse a stale
+    extraction — the documented tune-and-rerun workflow depends on this."""
+    if getattr(args, "images", "auto") != "auto":
+        return "img=off"
+    return (
+        f"img=auto:min_px={getattr(args, 'image_min_px', '')}"
+        f":max_aspect={getattr(args, 'image_max_aspect', '')}"
+        f":min_cells={getattr(args, 'figure_min_cells', '')}"
+        f":dpi={getattr(args, 'figure_dpi', '')}"
+    )
+
+
 def work_dir(args: argparse.Namespace, parser_name: str) -> Path:
-    """Checkpoint dir keyed by stem + content hash, so two PDFs that share a filename
-    (or a re-downloaded/fixed PDF with the same name) never reuse each other's cache."""
+    """Checkpoint dir keyed by stem + content hash (+ image-options signature), so two
+    PDFs that share a filename — or the same PDF run with different image settings —
+    never reuse each other's cache."""
     if not args.input_pdf.is_file():
         sys.exit(f"error: input PDF not found: {args.input_pdf}")
     h = hashlib.sha256()
     with args.input_pdf.open("rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
+    h.update(_image_options_signature(args).encode())
     d = args.workdir / f"{args.input_pdf.stem}-{h.hexdigest()[:8]}" / parser_name
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -367,7 +384,12 @@ def clean_chunks(
                 )
                 temperature = 0.4
             out, src_words, out_words = _clean_body(client, model, chunk, attempt_prompt, temperature)
-            ratio = out_words / max(1, src_words)
+            # an image-only chunk (no prose to clean) has no meaningful ratio — accept it
+            # rather than fail the fidelity check on 0/0 and abort the whole run
+            if src_words == 0:
+                ratio = 1.0
+                break
+            ratio = out_words / src_words
             if FIDELITY_BOUNDS[0] <= ratio <= FIDELITY_BOUNDS[1]:
                 break
             print(

@@ -1,6 +1,6 @@
 # Spec: Preserve images in the generated EPUB
 
-Status: proposed · Target version: 0.4.0 · Author: pdf2epub maintainers
+Status: proposed · Author: pdf2epub maintainers
 
 ## 1. Problem
 
@@ -218,14 +218,25 @@ pages 32/94/171; assert `EPUB/media/` figure count matches, calibre
 
 ## 8. Risks
 
-- **Runaway text absorption** pulling body text into a figure. Mitigation:
-  absorb only *strictly intersecting* blocks and iterate to a fixed point; on
-  the reference book body text never intersects (6 pt gap above the figure). Cap
-  iterations as a backstop.
+- **Runaway text absorption** pulling body text into a figure. `_absorb_text`
+  unions a text block's *whole* bbox on any overlap, so where PyMuPDF segments a
+  page into large multi-paragraph blocks a figure that merely grazes one could
+  swallow it in a single pass (the iteration cap bounds passes, not per-pass
+  size); the absorbed text becomes part of the image and is redacted from the
+  prose. On the reference book, blocks segment per-paragraph and body text does
+  not intersect the figure (≈6 pt gap), so this does not trigger — but it is the
+  main correctness risk for differently-typeset sources. Future guard: cap the
+  area a single absorption may add, or skip full-column body blocks.
+- **Same risk in `_merge_bands`**: it unions regions sharing a y-band with no
+  horizontal-gap bound, so two unrelated same-row figures (with prose between)
+  could merge into one composite whose text is redacted. Fine on the reference
+  book (one figure per band); a horizontal-gap bound is the future guard.
 - **Over/under-detection** of vector figures on other books. Mitigation:
   `--figure-min-cells` / `--image-min-px` / `--image-max-aspect` knobs; log each
-  detected region's page and size so a user can re-tune and rerun (cache makes
-  reruns cheap).
+  detected region's page and size so a user can re-tune and rerun. The workdir
+  key includes an image-options signature (`_image_options_signature`), so
+  changing any of these flags forces a fresh extraction rather than silently
+  reusing the cached `extracted.md`.
 - **Within-page ordering**: refs land at page end (correct for this book;
   documented limitation for mid-page figures).
 - **Performance**: `get_drawings()` on figure-dense pages is the main cost;
