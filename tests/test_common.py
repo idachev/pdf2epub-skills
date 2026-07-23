@@ -148,6 +148,20 @@ def test_clean_text_passes_through_when_nothing_blocked(monkeypatch):
     assert common._clean_text(None, "model", "anything", "prompt") == "cleaned"
 
 
+def test_clean_text_bisects_empty_response_and_keeps_offending_paragraph_verbatim(monkeypatch):
+    # a persistently-empty completion is recovered like a block: bisect, keep the
+    # offending paragraph verbatim, never abort the run
+    def fake_generate(client, model, contents, system_instruction, temperature=0.1, **kwargs):
+        if "EMPTYME" in contents:
+            raise common.EmptyResponseError("finish_reason=STOP")
+        return contents.lower()
+
+    monkeypatch.setattr(common, "generate", fake_generate)
+    text = "GOOD ONE\n\nEMPTYME PARA\n\nGOOD TWO"
+    out = common._clean_text(None, "model", text, "prompt")
+    assert out == "good one\n\nEMPTYME PARA\n\ngood two"
+
+
 # --------------------------------------------------- image-ref protection in cleanup
 
 

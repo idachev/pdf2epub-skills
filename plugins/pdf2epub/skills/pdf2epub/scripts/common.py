@@ -144,6 +144,12 @@ class PromptBlockedError(RuntimeError):
     """The input was rejected by Gemini's non-configurable content filter."""
 
 
+class EmptyResponseError(RuntimeError):
+    """The model returned an empty completion (finish_reason=STOP, no text) on every
+    retry. Some benign chunks trigger this deterministically; callers should bisect
+    and keep the offending paragraph verbatim rather than abort the whole book."""
+
+
 def generate(
     client,
     model: str,
@@ -157,6 +163,7 @@ def generate(
 
     delay = 5.0
     last_error = "unknown error"
+    last_was_empty = False
     for attempt in range(max_retries + 1):
         try:
             resp = client.models.generate_content(
@@ -178,15 +185,21 @@ def generate(
                 # output-side block is as deterministic as an input block — let callers bisect
                 raise PromptBlockedError(f"finish_reason={finish_name}")
             last_error = f"empty model response (finish_reason={finish_name})"
+            last_was_empty = True
         except errors.APIError as e:
             if e.code not in RETRYABLE_CODES:
                 raise
             last_error = f"API error {e.code}"
+            last_was_empty = False
         if attempt == max_retries:
             break
         print(f"  {last_error}; retrying in {delay:.0f}s", file=sys.stderr)
         time.sleep(delay)
         delay = min(delay * 2, 120)
+    if last_was_empty:
+        # a persistently-empty completion is effectively an output-side block — let the
+        # caller bisect and keep the offending paragraph verbatim instead of aborting
+        raise EmptyResponseError(last_error)
     sys.exit(f"error: Gemini call failed after {max_retries + 1} attempts ({last_error})")
 
 
@@ -323,18 +336,21 @@ def _clean_body(
 
 
 def _clean_text(client, model: str, text: str, prompt: str, temperature: float = 0.1) -> str:
-    """Clean one piece of text; on an input-filter block, bisect by paragraph and recurse.
+    """Clean one piece of text; on a block or a persistently-empty response, bisect by
+    paragraph and recurse.
 
     Gemini's copyrighted-text filter can reject a chunk (typically one combining the
-    book's title, author, and body text). Halving isolates the offending paragraphs;
-    a single paragraph that is still blocked is kept verbatim.
+    book's title, author, and body text), and some benign chunks draw an empty
+    completion on every retry. Both are handled the same way: halving isolates the
+    offending paragraphs; a single paragraph that still fails is kept verbatim.
     """
     try:
         return generate(client, model, text, prompt, temperature=temperature)
-    except PromptBlockedError as e:
+    except (PromptBlockedError, EmptyResponseError) as e:
+        reason = "blocked by input filter" if isinstance(e, PromptBlockedError) else "empty model response"
         blocks = text.split("\n\n")
         if len(blocks) == 1:
-            print(f"  warning: paragraph blocked by input filter ({e}); kept verbatim", file=sys.stderr)
+            print(f"  warning: paragraph {reason} ({e}); kept verbatim", file=sys.stderr)
             return text
         mid = len(blocks) // 2
         left = _clean_text(client, model, "\n\n".join(blocks[:mid]), prompt, temperature)
@@ -463,7 +479,7 @@ def extract_metadata(
         language = validate_language(data.get("language"))
         language_name = _single_line(data.get("language_name"))
         return title, author, language, language_name
-    except (PromptBlockedError, json.JSONDecodeError, AttributeError, errors.APIError) as e:
+    except (PromptBlockedError, EmptyResponseError, json.JSONDecodeError, AttributeError, errors.APIError) as e:
         print(f"  warning: metadata extraction failed ({e}); using fallbacks", file=sys.stderr)
         return None, None, None, None
 
