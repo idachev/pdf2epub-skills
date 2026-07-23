@@ -1,7 +1,7 @@
 {
   "name": "pdf2epub",
   "description": "Convert a text-based PDF book into a clean, e-reader-ready EPUB using local PyMuPDF4LLM extraction plus Gemini text cleanup. Works with any source language — title, author, and language are auto-detected.",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "author": {
     "name": "Ivan Dachev",
     "email": "i_dachev@yahoo.co.uk"
