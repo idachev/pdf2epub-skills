@@ -175,7 +175,7 @@ def test_is_image_block():
 def test_clean_body_no_image_is_single_pass(monkeypatch):
     calls = []
 
-    def fake(client, model, text, prompt, temperature=0.1):
+    def fake(client, model, text, prompt, temperature=0.1, where=""):
         calls.append(text)
         return text
 
@@ -187,7 +187,7 @@ def test_clean_body_no_image_is_single_pass(monkeypatch):
 
 def test_clean_body_passes_image_blocks_through_and_excludes_from_ratio(monkeypatch):
     monkeypatch.setattr(
-        common, "_clean_text", lambda client, model, text, prompt, temperature=0.1: text.upper()
+        common, "_clean_text", lambda client, model, text, prompt, temperature=0.1, where="": text.upper()
     )
     chunk = "hello world\n\n![](images/fig-0001-00.png)\n\nmore text here"
     out, src, dst = common._clean_body(None, "m", chunk, "prompt")

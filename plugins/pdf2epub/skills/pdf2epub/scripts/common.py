@@ -295,7 +295,7 @@ def _is_image_block(block: str) -> bool:
 
 
 def _clean_body(
-    client, model: str, chunk: str, prompt: str, temperature: float = 0.1
+    client, model: str, chunk: str, prompt: str, temperature: float = 0.1, where: str = ""
 ) -> tuple[str, int, int]:
     """Clean a chunk's prose while passing image-ref blocks through verbatim.
 
@@ -303,10 +303,10 @@ def _clean_body(
     and must not count toward the fidelity ratio (a figure-dense chunk would
     otherwise look like it lost content). Returns (cleaned, src_words, out_words)
     counting only the non-image text. A chunk with no image refs takes the exact
-    same single-call path as before.
+    same single-call path as before. `where` labels the chunk in warnings.
     """
     if not _IMAGE_BLOCK_RE.search(chunk):
-        out = _clean_text(client, model, chunk, prompt, temperature)
+        out = _clean_text(client, model, chunk, prompt, temperature, where)
         return out, len(chunk.split()), len(out.split())
 
     blocks = [b for b in re.split(r"\n\s*\n", chunk) if b.strip()]
@@ -319,7 +319,7 @@ def _clean_body(
         if not buffer:
             return
         seg = "\n\n".join(buffer)
-        cleaned = _clean_text(client, model, seg, prompt, temperature)
+        cleaned = _clean_text(client, model, seg, prompt, temperature, where)
         out_parts.append(cleaned)
         src_words += len(seg.split())
         out_words += len(cleaned.split())
@@ -335,7 +335,7 @@ def _clean_body(
     return "\n\n".join(out_parts), src_words, out_words
 
 
-def _clean_text(client, model: str, text: str, prompt: str, temperature: float = 0.1) -> str:
+def _clean_text(client, model: str, text: str, prompt: str, temperature: float = 0.1, where: str = "") -> str:
     """Clean one piece of text; on a block or a persistently-empty response, bisect by
     paragraph and recurse.
 
@@ -343,6 +343,7 @@ def _clean_text(client, model: str, text: str, prompt: str, temperature: float =
     book's title, author, and body text), and some benign chunks draw an empty
     completion on every retry. Both are handled the same way: halving isolates the
     offending paragraphs; a single paragraph that still fails is kept verbatim.
+    `where` labels the source chunk so the verbatim warning is traceable.
     """
     try:
         return generate(client, model, text, prompt, temperature=temperature)
@@ -350,11 +351,12 @@ def _clean_text(client, model: str, text: str, prompt: str, temperature: float =
         reason = "blocked by input filter" if isinstance(e, PromptBlockedError) else "empty model response"
         blocks = text.split("\n\n")
         if len(blocks) == 1:
-            print(f"  warning: paragraph {reason} ({e}); kept verbatim", file=sys.stderr)
+            loc = f" in {where}" if where else ""
+            print(f"  warning: paragraph {reason}{loc} ({e}); kept verbatim", file=sys.stderr)
             return text
         mid = len(blocks) // 2
-        left = _clean_text(client, model, "\n\n".join(blocks[:mid]), prompt, temperature)
-        right = _clean_text(client, model, "\n\n".join(blocks[mid:]), prompt, temperature)
+        left = _clean_text(client, model, "\n\n".join(blocks[:mid]), prompt, temperature, where)
+        right = _clean_text(client, model, "\n\n".join(blocks[mid:]), prompt, temperature, where)
         return left + "\n\n" + right
 
 
@@ -379,7 +381,12 @@ def clean_chunks(
 
     def clean_one(numbered: tuple[int, str]) -> str:
         i, chunk = numbered
-        ckpt = checkpoint_dir / f"chunk_{i:04d}.md"
+        # content-addressed checkpoint keyed by the chunk text AND the cleanup prompt: if
+        # either changes (re-chunking, new extraction, an edited prompt), the hash changes
+        # and the stale cache is a clean miss instead of being served wrongly. Identical
+        # reruns still hit 100%.
+        chunk_hash = hashlib.sha1(f"{prompt}\x00{chunk}".encode("utf-8")).hexdigest()[:10]
+        ckpt = checkpoint_dir / f"chunk_{i:04d}_{chunk_hash}.md"
         if ckpt.exists():
             print(f"[{i}/{total}] cached")
             return ckpt.read_text(encoding="utf-8")
@@ -399,7 +406,9 @@ def clean_chunks(
                     "source text fully and exactly; remove only layout artifacts."
                 )
                 temperature = 0.4
-            out, src_words, out_words = _clean_body(client, model, chunk, attempt_prompt, temperature)
+            out, src_words, out_words = _clean_body(
+                client, model, chunk, attempt_prompt, temperature, where=f"chunk {i}"
+            )
             # an image-only chunk (no prose to clean) has no meaningful ratio — accept it
             # rather than fail the fidelity check on 0/0 and abort the whole run
             if src_words == 0:
