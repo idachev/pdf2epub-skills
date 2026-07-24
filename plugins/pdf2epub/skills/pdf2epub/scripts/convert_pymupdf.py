@@ -72,7 +72,7 @@ def main() -> None:
             dpi=args.figure_dpi,
         )
     md = extract_markdown(args.input_pdf, wd / "extracted.md", wd / "images", opts)
-    chunks = common.chunk_markdown(md)
+    chunks = common.chunk_markdown(md, strip_toc=not args.keep_toc)
     print(f"stage 1: {len(chunks)} chunks")
     client = common.get_client()
     cleaned = common.clean_chunks(

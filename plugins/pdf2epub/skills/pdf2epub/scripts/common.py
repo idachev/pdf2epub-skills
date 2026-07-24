@@ -55,6 +55,12 @@ def base_arg_parser(parser_name: str) -> argparse.ArgumentParser:
         help="Checkpoint/cache directory (default: tmp/pdf2epub)",
     )
     p.add_argument(
+        "--keep-toc",
+        action="store_true",
+        help="Keep the source PDF's own printed Contents/TOC listing in the EPUB body "
+        "(dropped by default since pandoc's --toc already builds a clickable nav)",
+    )
+    p.add_argument(
         "--strip-watermark",
         action="append",
         default=[],
@@ -265,9 +271,106 @@ def merge_split_paragraphs(blocks: list[str]) -> list[str]:
     return merged
 
 
-def chunk_markdown(md: str, target_words: int = TARGET_CHUNK_WORDS) -> list[str]:
+_TOC_HEADING_RE = re.compile(r"^(table of contents|contents)$", re.IGNORECASE)
+_DOT_LEADER_LINE_RE = re.compile(r".+[.․…]{2,}\s*\d{1,4}\s*\|?\s*$")
+_BARE_PAGE_MARKER_RE = re.compile(r"^\*{0,2}\d{1,4}\*{0,2}$")
+
+
+def _block_heading_text(block: str) -> str | None:
+    """If `block` is exactly one Markdown heading line, its text with `**`/`__`
+    emphasis markers stripped; otherwise None."""
+    lines = [l for l in block.splitlines() if l.strip()]
+    if len(lines) != 1:
+        return None
+    m = _HEADING_RE.match(lines[0].strip())
+    return re.sub(r"[*_]+", "", m.group(2)).strip() if m else None
+
+
+def _is_toc_heading_block(block: str) -> bool:
+    text = _block_heading_text(block)
+    return text is not None and bool(_TOC_HEADING_RE.fullmatch(text))
+
+
+def _is_short_heading_block(block: str, max_words: int = 8) -> bool:
+    """True if every line in the block is a short Markdown heading. A running
+    header can render as more than one heading line glued into a single block
+    (e.g. the book title directly above "Contents" with no blank line between
+    them), so this checks all lines rather than requiring exactly one."""
+    lines = [l for l in block.splitlines() if l.strip()]
+    if not lines:
+        return False
+    for line in lines:
+        m = _HEADING_RE.match(line.strip())
+        if not m or len(re.sub(r"[*_]+", "", m.group(2)).split()) > max_words:
+            return False
+    return True
+
+
+def _is_toc_listing_block(block: str) -> bool:
+    """True for a block shaped like one page of a printed table-of-contents:
+    pymupdf4llm renders these as a single-column pipe table; plainer PDFs keep
+    them as dot-leader lines (`Chapter Title .......... 12`); either format
+    also carries bare page-footer numbers (`6`, `**6**`) between entries."""
+    lines = [l for l in block.splitlines() if l.strip()]
+    if not lines:
+        return False
+    if all(l.lstrip().startswith("|") for l in lines):
+        return True
+    if _BARE_PAGE_MARKER_RE.fullmatch(block.strip()):
+        return True
+    hits = sum(1 for l in lines if _DOT_LEADER_LINE_RE.match(l.strip()))
+    return hits / len(lines) >= 0.6
+
+
+def strip_table_of_contents(md: str) -> str:
+    """Drop the source PDF's own printed Contents/TOC listing.
+
+    pandoc already builds a real, clickable EPUB nav from the compiled headings
+    (`--toc`), so the printed contents page carried over from the PDF — chapter
+    titles and page numbers with no functional links — is just a non-clickable
+    duplicate once it lands in the EPUB body. Starting from the first heading
+    whose text is exactly "Contents"/"Table of Contents", this consumes
+    following blocks while they're shaped like TOC-listing content (see
+    `_is_toc_listing_block`), including a run of short running-header blocks
+    (books repeat "CONTENTS" and the book title on every TOC page) as long as
+    that run is confirmed to lead back into more listing content — otherwise
+    the run is left in place, since it may be a real (if short) heading.
+    Stops at the first block that looks like real prose. If nothing after the
+    heading matches that shape, the Markdown is left untouched — dropping only
+    the heading itself would lose a legitimate section title."""
+    blocks = [b for b in re.split(r"\n\s*\n", md) if b.strip()]
+    heading_idx = next((i for i, b in enumerate(blocks) if _is_toc_heading_block(b)), None)
+    if heading_idx is None:
+        return md
+    end = heading_idx + 1
+    while end < len(blocks):
+        if _is_toc_listing_block(blocks[end]):
+            end += 1
+            continue
+        if _is_short_heading_block(blocks[end]):
+            # a run of one or more short-heading blocks (book title, "CONTENTS")
+            # only counts as running-header noise if it's confirmed to lead back
+            # into listing content — otherwise it's a real heading and the run
+            # (including a lone short chapter heading) must be left untouched
+            j = end + 1
+            while j < len(blocks) and _is_short_heading_block(blocks[j]):
+                j += 1
+            if j < len(blocks) and _is_toc_listing_block(blocks[j]):
+                end = j
+                continue
+        break
+    if end == heading_idx + 1:
+        return md
+    kept = blocks[:heading_idx] + blocks[end:]
+    return "\n\n".join(kept)
+
+
+def chunk_markdown(md: str, target_words: int = TARGET_CHUNK_WORDS, strip_toc: bool = True) -> list[str]:
     """Split Markdown into ~target_words chunks, only at paragraph/heading boundaries."""
-    raw_blocks = [b.strip() for b in re.split(r"\n\s*\n", strip_page_artifacts(md)) if b.strip()]
+    md = strip_page_artifacts(md)
+    if strip_toc:
+        md = strip_table_of_contents(md)
+    raw_blocks = [b.strip() for b in re.split(r"\n\s*\n", md) if b.strip()]
     blocks = merge_split_paragraphs(raw_blocks)
     chunks: list[str] = []
     current: list[str] = []

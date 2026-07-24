@@ -56,7 +56,121 @@ def test_does_not_merge_into_or_out_of_headings():
     assert common.merge_split_paragraphs(blocks) == blocks
 
 
+# ------------------------------------------------------------ strip_table_of_contents
+
+
+def test_drops_dot_leader_toc_after_contents_heading():
+    md = (
+        "## Contents\n\n"
+        "Chapter One .......................... 12\n"
+        "Chapter Two .......................... 40\n\n"
+        "## Chapter One\n\n"
+        "It was a dark and stormy night."
+    )
+    out = common.strip_table_of_contents(md)
+    assert "Chapter One .." not in out
+    assert "## Chapter One" in out
+    assert "It was a dark and stormy night." in out
+
+
+def test_drops_pipe_table_toc_and_repeated_running_headers():
+    md = (
+        "## **Contents**\n\n"
+        "|Chapter One .......................... 12|\n"
+        "|---|\n"
+        "|Chapter Two .......................... 40|\n\n"
+        "**6**\n\n"
+        "#### **CONTENTS**\n\n"
+        "|Chapter Three .......................... 55|\n"
+        "|---|\n\n"
+        "## Chapter One\n\n"
+        "Real prose starts here."
+    )
+    out = common.strip_table_of_contents(md)
+    assert "Chapter One .." not in out and "Chapter Two .." not in out and "Chapter Three .." not in out
+    assert "**CONTENTS**" not in out
+    assert "## Chapter One" in out
+    assert "Real prose starts here." in out
+
+
+def test_no_contents_heading_is_a_no_op():
+    md = "# Title\n\nSome prose.\n\n## Chapter One\n\nMore prose."
+    assert common.strip_table_of_contents(md) == md
+
+
+def test_contents_heading_with_no_listing_after_it_is_untouched():
+    # a book that has a "Contents" heading followed directly by real prose (no
+    # table/dot-leader shape) must not have that heading silently dropped
+    md = "## Contents\n\nThis chapter discusses the contents of the box in detail."
+    assert common.strip_table_of_contents(md) == md
+
+
+def test_keeps_real_pipe_table_elsewhere_in_the_book():
+    md = "## Chapter One\n\n|Spec|Value|\n|---|---|\n|Weight|10kg|\n\nMore prose after the table."
+    assert common.strip_table_of_contents(md) == md
+
+
+def test_drops_multiple_consecutive_running_header_blocks():
+    # book title and "CONTENTS" as two separate blocks (not glued into one)
+    # sandwiched between TOC-shaped listing blocks
+    md = (
+        "## Contents\n\n"
+        "|Chapter One .......................... 12|\n|---|\n\n"
+        "**6**\n\n"
+        "#### Book Title\n\n"
+        "##### CONTENTS\n\n"
+        "|Chapter Two .......................... 40|\n|---|\n\n"
+        "## Chapter One\n\n"
+        "Real prose starts here."
+    )
+    out = common.strip_table_of_contents(md)
+    assert "Chapter One .." not in out and "Chapter Two .." not in out
+    assert "Book Title" not in out and "CONTENTS" not in out
+    assert "## Chapter One" in out
+    assert "Real prose starts here." in out
+
+
+def test_drops_glued_two_line_running_header_block():
+    # book title and "Contents" as two heading lines in a single block (no
+    # blank line between them in the source extraction)
+    md = (
+        "## Contents\n\n"
+        "|Chapter One .......................... 12|\n|---|\n\n"
+        "**6**\n\n"
+        "#### Book Title\n##### CONTENTS\n\n"
+        "|Chapter Two .......................... 40|\n|---|\n\n"
+        "## Chapter One\n\n"
+        "Real prose starts here."
+    )
+    out = common.strip_table_of_contents(md)
+    assert "Chapter One .." not in out and "Chapter Two .." not in out
+    assert "Book Title" not in out
+    assert "## Chapter One" in out
+    assert "Real prose starts here." in out
+
+
+def test_keeps_short_heading_run_followed_by_real_prose():
+    # a real "Part One" / "Chapter 1" heading pair must survive even though
+    # each is individually short — nothing after them is TOC-shaped
+    md = "## Contents\n\n## Part One\n\n## Chapter 1\n\nReal prose starts here."
+    assert common.strip_table_of_contents(md) == md
+
+
 # ------------------------------------------------------------------ chunk_markdown
+
+
+def test_chunk_markdown_strips_toc_by_default():
+    md = "## Contents\n\nChapter One .......................... 12\n\n## Chapter One\n\nReal prose."
+    chunks = common.chunk_markdown(md)
+    joined = "\n\n".join(chunks)
+    assert "Chapter One .." not in joined
+    assert "Real prose." in joined
+
+
+def test_chunk_markdown_keeps_toc_when_disabled():
+    md = "## Contents\n\nChapter One .......................... 12\n\n## Chapter One\n\nReal prose."
+    chunks = common.chunk_markdown(md, strip_toc=False)
+    assert "Chapter One .......................... 12" in "\n\n".join(chunks)
 
 
 def test_chunks_split_only_at_block_boundaries():
