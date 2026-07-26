@@ -153,6 +153,33 @@ def placeholder_ids(text: str) -> tuple[tuple[int, str], ...]:
     return tuple(sorted((int(m.group(2)), _kind(m)) for m in PLACEHOLDER_RE.finditer(text)))
 
 
+def placeholder_spans(text: str) -> dict[int, bool]:
+    """For each paired placeholder index, whether its span holds non-whitespace text.
+
+    Parity and nesting checks both pass for `[[1]][[/1]]` — the tags are all present
+    and correctly balanced, they just have nothing between them. A model under filter
+    pressure does exactly that: it keeps the markup and drops the emphasized words.
+    Comparing spans against the source catches the lost content.
+    """
+    spans: dict[int, bool] = {}
+    open_at: dict[int, int] = {}
+    for m in PLACEHOLDER_RE.finditer(text):
+        idx, kind = int(m.group(2)), _kind(m)
+        if kind == "open":
+            open_at[idx] = m.end()
+        elif kind == "close" and idx in open_at:
+            inner = text[open_at.pop(idx) : m.start()]
+            # nested placeholders don't count as this span's own text
+            spans[idx] = bool(PLACEHOLDER_RE.sub("", inner).strip())
+    return spans
+
+
+def keeps_placeholder_content(source: str, candidate: str) -> bool:
+    """True if every paired placeholder that held text in `source` still holds text."""
+    src, cand = placeholder_spans(source), placeholder_spans(candidate)
+    return all(not had_text or cand.get(idx, False) for idx, had_text in src.items())
+
+
 def _build(unit: Unit, translated: str) -> etree._Element:
     """Rebuild `translated` into a detached element, or raise ValueError.
 

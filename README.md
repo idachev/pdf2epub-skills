@@ -56,6 +56,9 @@ uv run plugins/pdf2epub/skills/epub-translate/scripts/translate_epub.py "path/to
 | `--target-language-name NAME` | Full English language name (default: derived from the code) |
 | `--glossary PATH` | JSON glossary of source→target terms applied consistently |
 | `--model NAME` | Gemini model (default: `gemini-3.6-flash`) |
+| `--fallback-model NAME` | Second model to retry a unit the primary keeps refusing (off by default) |
+| `--unit-retries N` | Solo attempts per model for a unit that failed in its chunk (default: 2) |
+| `--repair-verbatim` | On cached chunks, re-translate units failing current validation. Implied by `--fallback-model` |
 | `--thinking-level LEVEL` | `minimal`/`low`/`medium`/`high`, or `none` for pre-Gemini-3 models (default: `low`) |
 | `--target-words N` | Approx. source words per API call (default: 1500) |
 | `--concurrency N` | Parallel calls (default: 4) |
@@ -66,7 +69,16 @@ uv run plugins/pdf2epub/skills/epub-translate/scripts/translate_epub.py "path/to
 
 Glossaries are user-supplied and live outside this repo — they encode terminology for one specific book or series. The format is a JSON object with string→string pairs under `terms`; any other keys (comments, notes) are ignored, so the file doubles as working notes.
 
-**Failures degrade rather than abort.** A chunk that comes back misaligned is retried unit by unit; a unit that still fails validation is left in the source language with a warning, and the run summary reports the count. Validation rejects a unit whose inline markup changed, whose placeholder nesting is broken, or which came back in the wrong script — so a bad response costs one paragraph, never a corrupted chapter.
+**Failures degrade rather than abort.** A chunk that comes back misaligned is retried unit by unit; a unit that still fails validation is left in the source language with a warning, and the run summary reports the count. Validation rejects a unit whose inline markup changed, whose placeholder nesting is broken, whose emphasized text was emptied out, whose length is implausible, or which came back in the wrong script — so a bad response costs one paragraph, never a corrupted chapter.
+
+**Content filters and the retry ladder.** Translating in-copyright prose runs into Gemini's non-configurable `RECITATION` filter, which refuses rather than answers. Two measured properties shape the response: blocks are partly *non-deterministic* (a plain repeat recovers a useful share — `--unit-retries`), and partly *model-specific with complementary failure sets* (a smaller model has memorized less of a famous text, so it refuses different passages — `--fallback-model`). On one measured sample of 58 stuck paragraphs the primary recovered 29%, a smaller fallback 45%, and either one 52%.
+
+Because checkpoints store a whole chunk including its give-ups, adding a fallback later would otherwise be served from cache. `--repair-verbatim` (implied by `--fallback-model`) re-translates exactly the units whose cached text fails current validation, so fixing a handful of paragraphs costs a handful of calls rather than a whole book:
+
+```bash
+uv run .../translate_epub.py "book.epub" -t bg --glossary g.json \
+  --fallback-model gemini-3.5-flash-lite
+```
 
 ## Requirements
 

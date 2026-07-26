@@ -226,6 +226,33 @@ def test_can_apply_catches_nesting_order_that_parity_misses():
     assert not epubdoc.can_apply(unit, bad)
 
 
+def test_placeholder_spans_reports_whether_a_pair_holds_text():
+    assert epubdoc.placeholder_spans("[[1]]words[[/1]]") == {1: True}
+    assert epubdoc.placeholder_spans("[[1]][[/1]]") == {1: False}
+    assert epubdoc.placeholder_spans("[[1]]   [[/1]]") == {1: False}
+    assert epubdoc.placeholder_spans("[[1/]]") == {}
+
+
+def test_placeholder_spans_ignores_nested_placeholders_as_own_text():
+    assert epubdoc.placeholder_spans("[[1]][[2/]][[/1]]") == {1: False}
+    assert epubdoc.placeholder_spans("[[1]]a[[2/]][[/1]]") == {1: True}
+
+
+def test_emptied_markup_is_rejected():
+    """Regression: `[[1]][[/1]]` has correct parity AND correct nesting, but has
+    dropped the words the source emphasized. Seen in practice on passages the
+    content filter resists."""
+    src = "he said [[1]]something[[/1]] quietly"
+    assert epubdoc.placeholder_ids(src) == epubdoc.placeholder_ids("той [[1]][[/1]] тихо")
+    assert epubdoc.keeps_placeholder_content(src, "той каза [[1]]нещо[[/1]] тихо")
+    assert not epubdoc.keeps_placeholder_content(src, "той каза [[1]][[/1]] тихо")
+
+
+def test_an_empty_source_span_may_stay_empty():
+    src = "text [[1]][[/1]] more"
+    assert epubdoc.keeps_placeholder_content(src, "текст [[1]][[/1]] още")
+
+
 def test_can_apply_mutates_nothing():
     root = parse("<p>a <i>b</i> c</p>")
     (unit,) = epubdoc.find_units(root)

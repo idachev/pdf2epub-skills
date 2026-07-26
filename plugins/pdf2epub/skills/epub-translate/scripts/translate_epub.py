@@ -49,6 +49,10 @@ DEFAULT_TARGET_WORDS = 1500
 # not stylistic choices.
 CYRILLIC_FLOOR = 0.45
 CYRILLIC_SCRIPTS = {"bg", "ru", "uk", "sr", "mk", "be"}
+# translated/source word ratio accepted for a unit long enough for the ratio to mean
+# something; wide because languages legitimately differ in wordiness, and this is only
+# meant to catch a fragment or a summary coming back in place of a translation
+WORD_RATIO_BOUNDS = (0.5, 1.9)
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,6 +74,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL})")
     p.add_argument(
+        "--fallback-model", default=None,
+        help="Second model to retry a unit on when the primary keeps refusing it "
+        "(content filters are partly model-specific, so a different model often "
+        "succeeds where the primary will not). Off by default.",
+    )
+    p.add_argument(
+        "--unit-retries", type=int, default=2,
+        help="Solo attempts per model for a unit that failed inside its chunk "
+        "(default: 2). Filter blocks are partly non-deterministic, so a plain "
+        "repeat recovers a useful share of them.",
+    )
+    p.add_argument(
         "--thinking-level", default="low",
         choices=["minimal", "low", "medium", "high", "none"],
         help="Gemini 3 thinking level (default: low; 'none' omits it for older models)",
@@ -81,6 +97,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--concurrency", type=int, default=4,
         help="Parallel Gemini translation calls (default: 4); 429s back off per worker",
+    )
+    p.add_argument(
+        "--repair-verbatim", action="store_true",
+        help="On a cached chunk, re-translate units whose cached text fails the "
+        "current validation — units a previous run left in the source language, and "
+        "units an older, laxer validator wrongly accepted. Implied by "
+        "--fallback-model.",
     )
     p.add_argument("--max-chunks", type=int, help="Translate only the first N chunks (smoke test)")
     p.add_argument(
@@ -170,6 +193,8 @@ class ChunkStats:
         self.units_ok = 0
         self.units_retried = 0
         self.units_verbatim = 0
+        self.units_via_fallback = 0
+        self.units_repaired = 0
         self.blocked = 0
 
     def bump(self, name: str, amount: int = 1) -> None:
@@ -214,10 +239,12 @@ def _translate_units(
         # easier alignment problem than a 20-unit chunk, and isolating it also
         # isolates whatever content tripped a filter.
         stats.bump("units_retried")
-        solo = _translate_single(client, args, system_prompt, unit, thinking)
-        if solo is not None and _unit_ok(unit, solo, args):
+        solo, via_fallback = _retry_unit(client, args, system_prompt, unit, thinking)
+        if solo is not None:
             result[i] = solo
             stats.bump("units_ok")
+            if via_fallback:
+                stats.bump("units_via_fallback")
         else:
             print(
                 f"  warning: {where} unit {i} could not be translated safely; "
@@ -229,12 +256,83 @@ def _translate_units(
     return result
 
 
-def _translate_single(
+def _retry_unit(
     client, args: argparse.Namespace, system_prompt: str, unit: epubdoc.Unit, thinking: str | None
+) -> tuple[str | None, bool]:
+    """Escalating solo retries for one unit. Returns (accepted_text, used_fallback).
+
+    Two properties of the content filters, both measured rather than assumed, shape
+    this ladder:
+
+    * Blocks are **partly non-deterministic** — repeating an identical request
+      recovers a useful share of units that were just refused. Hence
+      `--unit-retries` attempts per model rather than one.
+    * Blocks are **partly model-specific, and the sets are complementary** — a
+      smaller model has memorized less of a well-known text, so it trips a
+      recitation filter less often, while occasionally refusing something the
+      primary handled. Trying a second model therefore recovers strictly more than
+      either model alone. Hence `--fallback-model`.
+
+    Attempts are ordered cheapest-signal-first: exhaust the primary before paying
+    for a different model, so books that need no fallback never call one.
+    """
+    models = [(args.model, False)]
+    if args.fallback_model:
+        models.append((args.fallback_model, True))
+    for model, is_fallback in models:
+        for _ in range(max(1, args.unit_retries)):
+            got = _translate_once(client, model, system_prompt, unit, thinking)
+            if got is not None and _unit_ok(unit, got, args):
+                return got, is_fallback
+    return None, False
+
+
+def _repair_verbatim(
+    client, args: argparse.Namespace, system_prompt: str, units: list[epubdoc.Unit],
+    cached: dict[int, str], chunk_no: int, stats: ChunkStats,
+) -> int:
+    """Retry cached units that don't pass validation, mutating `cached` in place.
+
+    A checkpoint stores a whole chunk's result, including units that fell back to the
+    source language. Without this, resuming with a newly-added `--fallback-model`
+    would serve those give-ups straight from cache and the fallback would never run —
+    while putting the fallback model in the cache key instead would invalidate every
+    successful unit too and re-translate the entire book to fix a handful of
+    paragraphs. Repairing on load targets exactly the units that need it.
+
+    The trigger is simply "the cached text fails the *current* acceptance check", which
+    covers more than give-ups: it also re-fixes units an earlier, laxer version of the
+    validator wrongly accepted. Short units are naturally exempt, because a name or a
+    numeral that translates to itself still passes validation and so is never retried —
+    no special case needed, and no call burned on every resume.
+    """
+    if not (args.repair_verbatim or args.fallback_model):
+        return 0
+    thinking = None if args.thinking_level == "none" else args.thinking_level
+    repaired = 0
+    for i, unit in enumerate(units, 1):
+        current = cached.get(i)
+        if current is not None and _unit_ok(unit, current, args):
+            continue
+        got, via_fallback = _retry_unit(client, args, system_prompt, unit, thinking)
+        if got is None:
+            continue
+        cached[i] = got
+        repaired += 1
+        stats.bump("units_repaired")
+        if via_fallback:
+            stats.bump("units_via_fallback")
+    if repaired:
+        print(f"  repaired {repaired} previously-untranslated unit(s) in chunk {chunk_no}")
+    return repaired
+
+
+def _translate_once(
+    client, model: str, system_prompt: str, unit: epubdoc.Unit, thinking: str | None
 ) -> str | None:
     try:
         raw = common.generate(
-            client, args.model, epubdoc.render_chunk([unit]), system_prompt,
+            client, model, epubdoc.render_chunk([unit]), system_prompt,
             temperature=0.3, thinking_level=thinking,
         )
     except (common.PromptBlockedError, common.EmptyResponseError):
@@ -253,6 +351,19 @@ def _unit_ok(unit: epubdoc.Unit, candidate: str, args: argparse.Namespace) -> bo
     # falling back to the source language.
     if not epubdoc.can_apply(unit, candidate):
         return False
+    # ...nor can it see *emptied* markup: `[[1]][[/1]]` has correct parity and nesting
+    # but has dropped whatever the source emphasized. Observed in practice on passages
+    # the content filter resists.
+    if not epubdoc.keeps_placeholder_content(unit.text, candidate):
+        return False
+    # Loose net for wholesale truncation. Bulgarian and English word counts differ
+    # modestly, so the bounds are wide on purpose — this catches a unit that came back
+    # as a fragment or a summary, not stylistic variation.
+    src_words = unit.words
+    if src_words >= 12:
+        ratio = len(epubdoc.PLACEHOLDER_RE.sub(" ", candidate).split()) / src_words
+        if not WORD_RATIO_BOUNDS[0] <= ratio <= WORD_RATIO_BOUNDS[1]:
+            return False
     if args.target_language.split("-")[0].lower() in CYRILLIC_SCRIPTS:
         stripped = epubdoc.PLACEHOLDER_RE.sub(" ", candidate)
         # Short units are legitimately all-Latin (a name, a number, "OK") — only
@@ -337,10 +448,17 @@ def main() -> None:
         ckpt = ckpt_dir / f"chunk_{n:04d}_{key}.json"
         if ckpt.exists():
             try:
-                cached = json.loads(ckpt.read_text(encoding="utf-8"))
+                cached = {int(k): v for k, v in json.loads(ckpt.read_text(encoding="utf-8")).items()}
                 stats.bump("cached")
-                print(f"[{n}/{len(jobs)}] cached")
-                return n, doc, units, {int(k): v for k, v in cached.items()}
+                repaired = _repair_verbatim(client, args, system_prompt, units, cached, n, stats)
+                if repaired:
+                    common.atomic_write(
+                        ckpt, json.dumps({str(k): v for k, v in cached.items()}, ensure_ascii=False)
+                    )
+                    print(f"[{n}/{len(jobs)}] cached, repaired {repaired} unit(s)")
+                else:
+                    print(f"[{n}/{len(jobs)}] cached")
+                return n, doc, units, cached
             except (json.JSONDecodeError, ValueError):
                 pass  # corrupt checkpoint — retranslate
         out = _translate_units(client, args, system_prompt, units, f"chunk {n}", stats)
@@ -383,10 +501,14 @@ def main() -> None:
     epubdoc.repack(stage, out_path)
 
     elapsed = time.time() - started
+    fallback_note = (
+        f", {stats.units_via_fallback} via {args.fallback_model}" if args.fallback_model else ""
+    )
+    repaired_note = f", {stats.units_repaired} repaired from cache" if stats.units_repaired else ""
     print(
         f"\nchunks: {stats.chunks} translated, {stats.cached} cached\n"
         f"units: {stats.units_ok} ok, {stats.units_retried} retried, "
-        f"{stats.units_verbatim} kept verbatim\n"
+        f"{stats.units_verbatim} kept verbatim{fallback_note}{repaired_note}\n"
         f"blocked chunks: {stats.blocked}\n"
         f"time: {elapsed / 60:.1f} min\n"
         f"language: {args.target_language}\n"
