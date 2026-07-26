@@ -4,12 +4,12 @@
     "name": "Ivan Dachev",
     "email": "i_dachev@yahoo.co.uk"
   },
-  "description": "Convert text-based PDF books to clean, e-reader-ready EPUBs (local extraction + Gemini cleanup)",
+  "description": "Convert text-based PDF books to clean, e-reader-ready EPUBs and translate EPUBs into other languages (local extraction + Gemini)",
   "plugins": [
     {
       "name": "pdf2epub",
       "source": "./plugins/pdf2epub",
-      "description": "Convert a text-based PDF book into a clean, e-reader-ready EPUB using local PyMuPDF4LLM extraction plus Gemini text cleanup. Works with any source language.",
+      "description": "Convert a text-based PDF book into a clean, e-reader-ready EPUB using local PyMuPDF4LLM extraction plus Gemini text cleanup, and translate an existing EPUB into another language while preserving its structure, markup, and reading order. Works with any source language — title, author, and language are auto-detected.",
       "author": {
         "name": "Ivan Dachev"
       }

@@ -1,8 +1,13 @@
 # pdf2epub-skills
 
-A Claude Code plugin marketplace with one plugin: **pdf2epub**, a Claude Code skill that converts a text-based PDF book into a clean, e-reader-ready EPUB using local text extraction plus LLM-powered cleanup.
+A Claude Code plugin marketplace with one plugin, **pdf2epub**, hosting two complementary skills:
 
-It works with books in any language — title, author, and language are detected from the text itself, not from the PDF's (often unreliable) embedded metadata.
+| Skill | What it does |
+|---|---|
+| **`pdf2epub`** | Converts a text-based PDF book into a clean, e-reader-ready EPUB using local text extraction plus LLM-powered cleanup. |
+| **`epub-translate`** | Translates an existing EPUB into another language, preserving structure, markup, images, and reading order. |
+
+Both work with books in any language — for conversion, title, author, and language are detected from the text itself, not from the PDF's (often unreliable) embedded metadata.
 
 ## Install
 
@@ -11,7 +16,7 @@ It works with books in any language — title, author, and language are detected
 /plugin install pdf2epub@pdf2epub-skills
 ```
 
-Then ask Claude Code to convert a PDF, e.g. *"Convert /path/to/my-book.pdf to EPUB"*, and it will invoke the `pdf2epub` skill.
+Then ask Claude Code to convert a PDF (*"Convert /path/to/my-book.pdf to EPUB"*) or to translate one (*"Translate /path/to/book.epub into Bulgarian"*), and it will invoke the matching skill.
 
 ## How it works
 
@@ -24,9 +29,48 @@ PDF ──1──▶ Markdown ──2──▶ cleaned chunks ──3──▶ c
 3. **Aggregate** — chunks are concatenated; title, author, and language are LLM-detected from the opening chunk (unless overridden) and injected as YAML frontmatter.
 4. **Compile** — pandoc builds the EPUB (`--toc --split-level=2`, chapters split at `##` headings).
 
+## Translating an EPUB
+
+The `epub-translate` skill takes an EPUB — from `pdf2epub` or bought from a store — and emits a translated EPUB with the same structure.
+
+```
+EPUB ──1──▶ translation units ──2──▶ translated chunks ──3──▶ rebuilt XHTML ──4──▶ EPUB
+```
+
+1. **Unpack & locate** — the spine is resolved via `META-INF/container.xml`, and each content document is scanned for *translation units*: block elements holding text plus inline markup only.
+2. **Serialize** — each unit becomes a plain string with inline tags replaced by numbered placeholders (`He said [[1]]hello[[/1]].`), then units are grouped into ~1,500-word chunks per document.
+3. **Translate** — each chunk goes through Gemini (`gemini-3.6-flash`, `thinking_level: low`) with a literary-fidelity prompt and an optional glossary that keeps invented terminology consistent across the whole book.
+4. **Rebuild & repack** — each unit's children are rebuilt from the placeholders in the *translated* string, TOC labels are translated, `dc:language` is rewritten, and the EPUB is repacked directly (no pandoc — the book's own CSS, fonts, and images carry through untouched).
+
+**Markup never reaches the model as markup.** That is the point of the placeholder scheme: tag preservation becomes a structural guarantee rather than a hope, and because a placeholder carries its tag identity by index, a target language that moves an emphasized phrase to the front of the sentence carries the emphasis with it instead of stranding it on the wrong words.
+
+```bash
+uv run plugins/pdf2epub/skills/epub-translate/scripts/translate_epub.py "path/to/book.epub" \
+  -t bg --glossary path/to/glossary.json
+```
+
+| Option | Meaning |
+|---|---|
+| `-o, --output PATH` | EPUB destination (default: `<stem>.<lang>.epub` beside the input) |
+| `-t, --target-language CODE` | BCP-47 target language (default: `bg`) |
+| `--target-language-name NAME` | Full English language name (default: derived from the code) |
+| `--glossary PATH` | JSON glossary of source→target terms applied consistently |
+| `--model NAME` | Gemini model (default: `gemini-3.6-flash`) |
+| `--thinking-level LEVEL` | `minimal`/`low`/`medium`/`high`, or `none` for pre-Gemini-3 models (default: `low`) |
+| `--target-words N` | Approx. source words per API call (default: 1500) |
+| `--concurrency N` | Parallel calls (default: 4) |
+| `--max-chunks N` | Only first N chunks (cheap smoke test) |
+| `--doc-filter SUBSTR` | Only content documents whose filename contains this substring |
+| `--title-suffix TEXT` | Appended to the EPUB's `dc:title` |
+| `--workdir PATH` | Checkpoint dir (default: `tmp/epub-translate`) |
+
+Glossaries are user-supplied and live outside this repo — they encode terminology for one specific book or series. The format is a JSON object with string→string pairs under `terms`; any other keys (comments, notes) are ignored, so the file doubles as working notes.
+
+**Failures degrade rather than abort.** A chunk that comes back misaligned is retried unit by unit; a unit that still fails validation is left in the source language with a warning, and the run summary reports the count. Validation rejects a unit whose inline markup changed, whose placeholder nesting is broken, or which came back in the wrong script — so a bad response costs one paragraph, never a corrupted chapter.
+
 ## Requirements
 
-- Linux or macOS with [uv](https://docs.astral.sh/uv/) and [pandoc](https://pandoc.org/) on `PATH` (Python dependencies are declared inline in the script and resolved by `uv run` automatically)
+- Linux or macOS with [uv](https://docs.astral.sh/uv/) on `PATH`, plus [pandoc](https://pandoc.org/) for `pdf2epub` (Python dependencies are declared inline in each script and resolved by `uv run` automatically). `epub-translate` needs no pandoc.
 - `GEMINI_API_KEY` environment variable
 
 ## Direct CLI usage
@@ -61,11 +105,12 @@ The EPUB lands next to the PDF as `<name>.epub`; `--keep-md` also keeps the comp
 
 ## Testing
 
-Run the suite with `pytest`, giving `uv` the one runtime dep the tests import
-(`pymupdf`); pin Python ≥ 3.10 because the code uses PEP 604 unions:
+Run the suite with `pytest`, giving `uv` the two runtime deps the tests import
+(`pymupdf` for the figure tests, `lxml` for the translation tests); pin Python ≥ 3.10
+because the code uses PEP 604 unions:
 
 ```bash
-uvx --python 3.12 --with pymupdf pytest tests/ -q
+uvx --python 3.12 --with pymupdf --with lxml pytest tests/ -q
 ```
 
 This is exactly what CI runs. No `GEMINI_API_KEY` or network is needed — every
@@ -75,6 +120,19 @@ Gemini call is monkeypatched, and the figure tests build/read local PDFs only.
   pipeline stages: chunking, watermark stripping, image-ref protection, the
   fidelity-ratio edge cases, and figure detection/redaction on synthetic PDFs
   built in-memory with PyMuPDF.
+- **Translation tests** (`tests/test_epubdoc.py`) cover the pure EPUB stages on
+  synthetic fixtures: translation-unit discovery, placeholder serialization,
+  rebuilding inline markup through word-order changes, and the rejection cases
+  that keep a bad model response from corrupting a chapter — unbalanced or
+  out-of-order placeholders, unknown indices, and paired-vs-void confusion. It
+  also asserts a *rejected* translation leaves the element untouched, since the
+  caller's fallback is "keep the source text" and that is only safe if nothing
+  was half-rewritten. Container handling (spine order, dedupe, OPF metadata,
+  OCF-conformant repack, zip-slip refusal) is covered too. These need `lxml`:
+
+  ```bash
+  uvx --python 3.12 --with pymupdf --with lxml pytest tests/ -q
+  ```
 - **Fixture integration test** (`tests/test_sample_pdf.py`) runs the full
   detect → render → redact path against a committed, license-clean fixture,
   `tests/fixtures/sample_diagrams.pdf`. The fixture is authored entirely in code
@@ -91,20 +149,24 @@ Gemini call is monkeypatched, and the figure tests build/read local PDFs only.
   PDF, so it never runs in CI:
 
   ```bash
-  PDF2EPUB_TEST_BOOK="/path/to/book.pdf" uvx --python 3.12 --with pymupdf pytest tests/ -q
+  PDF2EPUB_TEST_BOOK="/path/to/book.pdf" uvx --python 3.12 --with pymupdf --with lxml pytest tests/ -q
   ```
 
 ## Repository layout
 
 ```
-.claude-plugin/marketplace.json                  marketplace manifest
-plugins/pdf2epub/.claude-plugin/plugin.json       plugin manifest
-plugins/pdf2epub/skills/pdf2epub/SKILL.md         Claude Code skill definition
-plugins/pdf2epub/skills/pdf2epub/scripts/         converter (convert_pymupdf.py, common.py, figures.py, prompts/)
-docs/specs/                                       design specs (e.g. image-preservation.md)
-tests/                                            pytest suite + fixtures/ (sample_diagrams.pdf, make_sample.py)
-tmp/                                              checkpoints and logs (not versioned)
+.claude-plugin/marketplace.json                    marketplace manifest
+plugins/pdf2epub/.claude-plugin/plugin.json         plugin manifest (the only place `version` lives)
+plugins/pdf2epub/skills/pdf2epub/SKILL.md           PDF→EPUB skill definition
+plugins/pdf2epub/skills/pdf2epub/scripts/           converter (convert_pymupdf.py, common.py, figures.py, prompts/)
+plugins/pdf2epub/skills/epub-translate/SKILL.md     EPUB translation skill definition
+plugins/pdf2epub/skills/epub-translate/scripts/     translator (translate_epub.py, epubdoc.py, prompts/)
+docs/specs/                                         design specs (e.g. image-preservation.md)
+tests/                                              pytest suite + fixtures/ (sample_diagrams.pdf, make_sample.py)
+tmp/                                                checkpoints and logs (not versioned)
 ```
+
+`epub-translate` imports `common.py` from the `pdf2epub` skill rather than forking it, so the Gemini client, retry/backoff, and content-filter handling have a single source of truth. Both skills ship in the same plugin, which is what makes that relative import stable wherever the plugin is installed.
 
 ## Delivery to Kindle
 
