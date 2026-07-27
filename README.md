@@ -5,7 +5,7 @@ A Claude Code plugin marketplace with one plugin, **pdf2epub**, hosting two comp
 | Skill | What it does |
 |---|---|
 | **`pdf2epub`** | Converts a text-based PDF book into a clean, e-reader-ready EPUB using local text extraction plus LLM-powered cleanup. |
-| **`epub-translate`** | Translates an existing EPUB into another language, preserving structure, markup, images, and reading order. |
+| **`epub-translate`** | Translates an existing EPUB into another language, preserving structure, markup, images, and reading order. Optional BgGPT post-pass polishes Bulgarian prose and retranslates leftover English. |
 
 Both work with books in any language — for conversion, title, author, and language are detected from the text itself, not from the PDF's (often unreliable) embedded metadata.
 
@@ -80,10 +80,31 @@ uv run .../translate_epub.py "book.epub" -t bg --glossary g.json \
   --fallback-model gemini-3.5-flash-lite
 ```
 
+### Bulgarian polish (BgGPT, optional)
+
+After Gemini translation to Bulgarian, an optional second pass uses [BgGPT](https://models.bggpt.ai/docs) to polish literary Bulgarian and **retranslate any paragraphs still left in English** (content-filter give-ups). It does not re-call Gemini; checkpoints live under `polish/` beside the original `chunks/`.
+
+```bash
+# From an existing Gemini workdir
+uv run plugins/pdf2epub/skills/epub-translate/scripts/polish_epub_bg.py \
+  --workdir tmp/epub-translate/<book-id> \
+  --source-epub path/to/original.en.epub \
+  -o path/to/book.bg.polished.epub \
+  --glossary path/to/glossary.json
+
+# Or from an already-emitted BG EPUB
+uv run plugins/pdf2epub/skills/epub-translate/scripts/polish_epub_bg.py \
+  --input-epub path/to/book.bg.epub \
+  -o path/to/book.bg.polished.epub
+```
+
+Requires `BGGPT_API_KEY`. Optional: `BGGPT_BASE_URL` (local OpenAI-compatible server), `BGGPT_MODEL` (default `bggpt-gemma-3-27b-fp8`). Smoke with `--max-chunks 2` or `--dry-run-sample 5` before a full book.
+
 ## Requirements
 
 - Linux or macOS with [uv](https://docs.astral.sh/uv/) on `PATH`, plus [pandoc](https://pandoc.org/) for `pdf2epub` (Python dependencies are declared inline in each script and resolved by `uv run` automatically). `epub-translate` needs no pandoc.
 - `GEMINI_API_KEY` environment variable
+- For Bulgarian polish only: `BGGPT_API_KEY`
 
 ## Direct CLI usage
 

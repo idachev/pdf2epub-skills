@@ -1,15 +1,15 @@
 ---
 name: epub-translate
-description: Translate an existing EPUB into another language with Gemini, preserving the book's structure, markup, images, and reading order. Inline tags survive word-order changes, chapter titles and the table of contents are translated too, and a user-supplied glossary keeps invented terminology consistent across the whole book. Use when the user asks to translate an EPUB or e-book into another language, localize a book they own, or resume/retry a previous translation.
+description: Translate an existing EPUB into another language with Gemini, preserving the book's structure, markup, images, and reading order. Inline tags survive word-order changes, chapter titles and the table of contents are translated too, and a user-supplied glossary keeps invented terminology consistent across the whole book. For Bulgarian targets, an optional BgGPT post-pass polishes prose and retranslates any English leftovers Gemini refused. Use when the user asks to translate an EPUB or e-book into another language, localize a book they own, polish a Bulgarian translation, or resume/retry a previous translation.
 ---
 
 # EPUB Translator (structure-preserving, Gemini)
 
 Companion to the `pdf2epub` skill: that one produces a clean EPUB from a PDF, this one translates an EPUB — from `pdf2epub` or bought from a store — into another language and emits a valid EPUB with the same structure, images, and reading order.
 
-Pipeline: unpack → resolve the spine via `META-INF/container.xml` → find *translation units* (block elements holding text plus inline markup) → serialize each unit with inline tags replaced by numbered placeholders → chunk per content document → Gemini translate per chunk (concurrent, checkpointed) → rebuild each unit's children from the placeholders in the translated string → translate TOC labels → rewrite `dc:language` → repack.
+Pipeline: unpack → resolve the spine via `META-INF/container.xml` → find *translation units* (block elements holding text plus inline markup) → serialize each unit with inline tags replaced by numbered placeholders → chunk per content document → Gemini translate per chunk (concurrent, checkpointed) → rebuild each unit's children from the placeholders in the translated string → translate TOC labels → rewrite `dc:language` → repack. Optional Bulgarian polish: BgGPT post-edits the Gemini units (and retranslates leftover English) before a final rebuild.
 
-Implementation lives alongside this skill in `scripts/` (entry: `translate_epub.py`, pure EPUB/XHTML logic: `epubdoc.py`, prompt: `prompts/`) — resolve these paths relative to this skill's own directory, not the user's project root.
+Implementation lives alongside this skill in `scripts/` (entry: `translate_epub.py`, polish: `polish_epub_bg.py`, pure EPUB/XHTML logic: `epubdoc.py`, prompts: `prompts/`) — resolve these paths relative to this skill's own directory, not the user's project root.
 
 ## Why placeholders instead of translating XHTML directly
 
@@ -21,8 +21,9 @@ Handing markup to a model and asking for markup back invites dropped attributes,
 ## Requirements
 
 - `GEMINI_API_KEY` environment variable (`GOOGLE_API_KEY` works as an alternative; verify with `[ -n "$GEMINI_API_KEY" ]` — never print it).
+- For the optional Bulgarian polish stage: `BGGPT_API_KEY` (hosted API at `https://api.bggpt.ai/v1`). Optional overrides: `BGGPT_BASE_URL` (local vLLM/Ollama), `BGGPT_MODEL` (default `bggpt-gemma-3-27b-fp8`).
 - `uv` on PATH. Dependencies are declared inline (PEP 723); `uv run` resolves them automatically. No `pandoc` needed — the EPUB is repacked directly, so the source book's own CSS, fonts, and images carry through untouched.
-- The `pdf2epub` skill must be present in the same plugin: this skill imports its `common.py` for the Gemini client, retry/backoff, and content-filter handling rather than forking that logic.
+- The `pdf2epub` skill must be present in the same plugin: this skill imports its `common.py` for the Gemini client, retry/backoff, and content-filter handling rather than forking that logic. The polish script uses a separate OpenAI-compatible client (`openai_client.py`) so the Gemini path never depends on the `openai` package.
 
 ## Usage
 
@@ -57,6 +58,61 @@ mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/translate_epub.py "/pat
   -t bg --glossary /path/to/glossary.json \
   > ./tmp/claude-logs/epub-translate-$(date +%Y%m%d-%H%M%S).log 2>&1
 ```
+
+## Bulgarian polish (BgGPT)
+
+After a Gemini translation to Bulgarian, prose is often readable but not fully native — calques, name drift, stiff dialogue. Optionally run a **separate** BgGPT post-pass that:
+
+1. **Polishes** already-Bulgarian units (grammar, idiom, register, consistent transliteration).
+2. **Retranslates** units still left in English (Gemini `RECITATION`/`SAFETY` give-ups that stayed in the source language).
+3. Keeps the same placeholder contract; on validation failure keeps the pre-polish text.
+4. Writes its own checkpoints under `polish/` so Gemini `chunks/` stay the recoverable baseline.
+
+Polish is **opt-in** and does not call Gemini. Two ways to feed it:
+
+```bash
+# From an existing Gemini workdir (no re-translation cost)
+uv run <skill-dir>/scripts/polish_epub_bg.py \
+  --workdir tmp/epub-translate/<book-id> \
+  --source-epub /path/to/original.en.epub \
+  -o /path/to/book.bg.polished.epub \
+  --glossary /path/to/glossary.json
+
+# From an already-emitted Bulgarian EPUB
+uv run <skill-dir>/scripts/polish_epub_bg.py \
+  --input-epub /path/to/book.bg.epub \
+  -o /path/to/book.bg.polished.epub \
+  --glossary /path/to/glossary.json
+```
+
+| Option | Meaning |
+|---|---|
+| `--workdir PATH` | Gemini translation workdir containing `chunks/` (needs `--source-epub`) |
+| `--source-epub PATH` | Original English (or source) EPUB used for the Gemini run |
+| `--input-epub PATH` | Already-translated BG EPUB (alternative to workdir mode) |
+| `-o, --output PATH` | Destination polished EPUB (**required**) |
+| `--glossary PATH` | Same glossary JSON as translate |
+| `--model NAME` | BgGPT model (default: `$BGGPT_MODEL` or `bggpt-gemma-3-27b-fp8`) |
+| `--bggpt-base-url URL` | OpenAI-compatible base URL (default: `$BGGPT_BASE_URL` or hosted API) |
+| `--target-words N` | Words per polish call (default: 1000; lower than translate for careful edits) |
+| `--translate-target-words N` | Must match the Gemini run's chunking when using `--workdir` (default: 1500) |
+| `--concurrency N` | Parallel BgGPT calls (default: 2) |
+| `--max-chunks N` / `--doc-filter SUBSTR` | Smoke-test controls |
+| `--force` | Ignore polish checkpoints |
+| `--english-only` | Only send leftover-English units to BgGPT (targeted EN→BG repair). In workdir mode still applies the full Gemini baseline so the rest of the book is not dropped |
+| `--with-source-en` | Attach original English beside BG when available (workdir only) |
+| `--dry-run-sample N` | Print N before/after pairs and exit without writing an EPUB |
+
+Smoke-test before a full book:
+
+```bash
+mkdir -p ./tmp/claude-logs && uv run <skill-dir>/scripts/polish_epub_bg.py \
+  --workdir tmp/epub-translate/<book-id> --source-epub book.epub \
+  -o /tmp/polish-smoke.epub --max-chunks 2 --dry-run-sample 5 \
+  > ./tmp/claude-logs/polish-smoke-$(date +%Y%m%d-%H%M%S).log 2>&1
+```
+
+The polish prompt treats long mostly-Latin units as **untranslated English** and instructs BgGPT to translate them into literary Bulgarian (not to "polish" English into different English). Short Latin names/numerals stay exempt, same as the translator's script check.
 
 ## Glossary format
 
