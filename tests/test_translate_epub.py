@@ -196,6 +196,21 @@ def test_rejects_an_untranslated_echo():
     assert not te._unit_ok(unit, unit.text, args())
 
 
+def test_rejects_echo_for_latin_script_targets():
+    """de/fr/es have no Cyrillic floor; echo detection must still reject wholesale English."""
+    unit = marked_unit()
+    assert not te._unit_ok(unit, unit.text, args(target_language="de"))
+
+
+def test_accepts_german_translation_that_is_not_an_echo():
+    unit = marked_unit()
+    de = (
+        "er sagte [[1]]etwas leises[[/1]] noch einmal zu ihr bevor die lange "
+        "kalte nacht endlich zu ende war"
+    )
+    assert te._unit_ok(unit, de, args(target_language="de"))
+
+
 def test_short_units_are_exempt_from_the_script_check():
     """A name or numeral legitimately stays in Latin script."""
     root = etree.fromstring(
@@ -203,6 +218,22 @@ def test_short_units_are_exempt_from_the_script_check():
     )
     (unit,) = epubdoc.find_units(root)
     assert te._unit_ok(unit, "Marco", args())
+
+
+def test_looks_like_echo_ignores_case_and_whitespace():
+    src = "one two three four five six seven eight nine"
+    assert te.looks_like_echo(src, "  One Two THREE four five six seven eight nine  ")
+    assert not te.looks_like_echo(src, "eins zwei three four five six seven eight nine")
+
+
+def test_nav_label_ok_rejects_echo_and_wrong_script():
+    assert not te._nav_label_ok("Chapter One Two Three", "Chapter One Two Three", args())
+    assert not te._nav_label_ok("Chapter One Two Three", "Still English title here", args())
+    assert te._nav_label_ok("Chapter One Two Three", "Глава първа две три", args())
+
+
+def test_nav_label_ok_accepts_short_translated_title():
+    assert te._nav_label_ok("Prologue", "Пролог", args())
 
 
 # ------------------------------------------------------------- verbatim repair
@@ -297,3 +328,88 @@ def test_stats_bump_is_serialized_across_threads():
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(lambda _: stats.bump("units_ok"), range(2000)))
     assert stats.units_ok == 2000
+
+
+# ---------------------------------------------------------- checkpoint format
+
+
+def test_checkpoint_round_trip_includes_source_fingerprints():
+    unit = make_unit()
+    payload = te.dump_unit_checkpoint([unit], {1: GOOD})
+    data = __import__("json").loads(payload)
+    assert data["format"] == 2
+    assert data["units"]["1"]["t"] == GOOD
+    assert data["units"]["1"]["s"] == epubdoc.source_fingerprint(unit.text)
+    assert te.load_unit_checkpoint(payload) == {1: GOOD}
+    with_fps = te.load_unit_checkpoint_with_fps(payload)
+    assert with_fps[1] == (GOOD, epubdoc.source_fingerprint(unit.text))
+
+
+def test_load_unit_checkpoint_accepts_legacy_flat_map():
+    legacy = '{"1": "едно две три", "2": "четири"}'
+    assert te.load_unit_checkpoint(legacy) == {1: "едно две три", 2: "четири"}
+    fps = te.load_unit_checkpoint_with_fps(legacy)
+    assert fps[1] == ("едно две три", None)
+
+
+def test_translate_once_degrades_on_system_exit(monkeypatch):
+    def boom(*a, **k):
+        raise SystemExit("rate limited")
+
+    monkeypatch.setattr(te.common, "generate", boom)
+    assert te._translate_once(None, "primary", "sys", make_unit(), "low") is None
+
+
+def test_translate_units_degrades_on_api_exception(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("API error 401")
+
+    monkeypatch.setattr(te.common, "generate", boom)
+    unit = make_unit()
+    stats = te.ChunkStats()
+    out = te._translate_units(None, args(unit_retries=1), "sys", [unit], "chunk 1", stats)
+    assert out[1] == unit.text
+    assert stats.units_verbatim == 1
+    assert stats.blocked == 1
+
+
+def test_translate_navigation_span_wrapped_and_gates(monkeypatch, tmp_path):
+    """Span-wrapped labels are collected; English echoes are not applied."""
+    nav = tmp_path / "nav.xhtml"
+    nav.write_text(
+        f'<?xml version="1.0" encoding="utf-8"?>'
+        f'<html xmlns="{XHTML}"><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops">'
+        f'<ol><li><a href="ch1.xhtml"><span>Chapter One Two Three Four</span></a></li>'
+        f'<li><a href="ch2.xhtml"><span>Chapter Two Three Four Five</span></a></li>'
+        f"</ol></nav></body></html>",
+        encoding="utf-8",
+    )
+    opf = tmp_path / "package.opf"
+    opf.write_text(
+        '<?xml version="1.0"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">'
+        "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+        '<dc:identifier id="uid">x</dc:identifier><dc:title>t</dc:title>'
+        "<dc:language>en</dc:language></metadata>"
+        '<manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" '
+        'properties="nav"/></manifest><spine><itemref idref="nav"/></spine></package>',
+        encoding="utf-8",
+    )
+
+    def fake_generate(client, model, contents, system_instruction, **kw):
+        return (
+            "<<<1>>>\nГлава първа две три четири\n"
+            "<<<2>>>\nChapter Two Three Four Five\n"  # echo — must be rejected
+        )
+
+    monkeypatch.setattr(te.common, "generate", fake_generate)
+    ckpt_dir = tmp_path / "chunks"
+    ckpt_dir.mkdir()
+    te.translate_navigation(
+        None, args(), "sys", opf, ckpt_dir=ckpt_dir
+    )
+    tree = etree.parse(str(nav))
+    labels = epubdoc.find_nav_labels(tree.getroot())
+    assert labels[0][1] == "Глава първа две три четири"
+    assert labels[1][1] == "Chapter Two Three Four Five"  # kept source
+    assert list(ckpt_dir.glob("nav_*.json"))

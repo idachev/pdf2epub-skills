@@ -22,6 +22,7 @@ Tag parity is therefore guaranteed by construction, not by asking politely — a
 
 from __future__ import annotations
 
+import hashlib
 import re
 import zipfile
 from dataclasses import dataclass, field
@@ -462,3 +463,47 @@ def cyrillic_ratio(text: str) -> float:
     if not letters:
         return 0.0
     return sum(1 for c in letters if "Ѐ" <= c <= "ӿ") / len(letters)
+
+
+def source_fingerprint(text: str) -> str:
+    """Stable short hash of a unit's source placeholder string.
+
+    Written into Gemini checkpoints so a later polish (or any consumer that re-chunks
+    the same EPUB) can refuse a map entry whose source text no longer matches — e.g.
+    when `--translate-target-words` or the document set drifted and chunk index N no
+    longer holds the same paragraphs.
+    """
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+
+
+# ----------------------------------------------------------------- navigation labels
+
+
+def find_nav_labels(root: etree._Element) -> list[tuple[etree._Element, str]]:
+    """NCX / EPUB3-nav label elements with their full text content.
+
+    NCX stores titles in `<text>`; EPUB3 nav often wraps them in
+    `<a href="…"><span>Chapter</span></a>`. Direct `el.text` misses the latter and
+    truncates mixed content (`Chapter <em>One</em>`). Full `itertext()` covers both.
+    """
+    found: list[tuple[etree._Element, str]] = []
+    for el in root.iter():
+        name = local_name(el.tag)
+        if name not in ("text", "a"):
+            continue
+        text = "".join(el.itertext()).strip()
+        if text:
+            found.append((el, text))
+    return found
+
+
+def set_nav_label(el: etree._Element, text: str) -> None:
+    """Replace a nav label's content with a single text node.
+
+    Child markup (spans, emphasis) is dropped: TOC labels are short titles, and
+    preserving mixed-content structure after free translation is not worth the risk
+    of leaving half-English fragments under the new title.
+    """
+    for child in list(el):
+        el.remove(child)
+    el.text = text

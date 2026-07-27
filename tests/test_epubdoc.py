@@ -524,3 +524,64 @@ def test_write_document_round_trips_a_parsed_tree(epub_tree):
     assert "Преведен текст." in path.read_text(encoding="utf-8")
     # still parseable after the rewrite
     assert epubdoc.find_units(etree.parse(str(path)).getroot())
+
+
+# ----------------------------------------------------------------- nav labels / fingerprints
+
+
+def test_source_fingerprint_is_stable_and_content_sensitive():
+    a = epubdoc.source_fingerprint("hello [[1]]world[[/1]]")
+    b = epubdoc.source_fingerprint("hello [[1]]world[[/1]]")
+    c = epubdoc.source_fingerprint("hello [[1]]there[[/1]]")
+    assert a == b
+    assert a != c
+    assert len(a) == 16
+
+
+def test_find_nav_labels_reads_direct_ncx_text():
+    root = etree.fromstring(
+        b'<?xml version="1.0"?>'
+        b'<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"><navMap>'
+        b'<navPoint><navLabel><text>Chapter One</text></navLabel></navPoint>'
+        b"</navMap></ncx>"
+    )
+    labels = epubdoc.find_nav_labels(root)
+    assert len(labels) == 1
+    assert labels[0][1] == "Chapter One"
+
+
+def test_find_nav_labels_reads_span_wrapped_epub3_nav():
+    """EPUB3 nav often wraps titles in <a><span>…</span></a>; el.text is empty."""
+    root = etree.fromstring(
+        f'<html xmlns="{XHTML}"><body><nav>'
+        f'<ol><li><a href="ch1.xhtml"><span>Chapter One</span></a></li></ol>'
+        f"</nav></body></html>".encode("utf-8")
+    )
+    labels = epubdoc.find_nav_labels(root)
+    assert len(labels) == 1
+    assert labels[0][1] == "Chapter One"
+    assert epubdoc.local_name(labels[0][0].tag) == "a"
+
+
+def test_find_nav_labels_reads_mixed_content():
+    root = etree.fromstring(
+        f'<html xmlns="{XHTML}"><body><nav>'
+        f'<a href="ch1.xhtml">Chapter <em>One</em></a>'
+        f"</nav></body></html>".encode("utf-8")
+    )
+    labels = epubdoc.find_nav_labels(root)
+    assert len(labels) == 1
+    assert labels[0][1] == "Chapter One"
+
+
+def test_set_nav_label_replaces_children_with_single_text_node():
+    root = etree.fromstring(
+        f'<html xmlns="{XHTML}"><body>'
+        f'<a href="ch1.xhtml"><span>Chapter One</span></a>'
+        f"</body></html>".encode("utf-8")
+    )
+    a = root.find(f".//{{{XHTML}}}a")
+    assert a is not None
+    epubdoc.set_nav_label(a, "Глава първа")
+    assert a.text == "Глава първа"
+    assert list(a) == []

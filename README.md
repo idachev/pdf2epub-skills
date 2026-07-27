@@ -200,7 +200,7 @@ plugins/pdf2epub/.claude-plugin/plugin.json         plugin manifest (the only pl
 plugins/pdf2epub/skills/pdf2epub/SKILL.md           PDF→EPUB skill definition
 plugins/pdf2epub/skills/pdf2epub/scripts/           converter (convert_pymupdf.py, common.py, figures.py, prompts/)
 plugins/pdf2epub/skills/epub-translate/SKILL.md     EPUB translation skill definition
-plugins/pdf2epub/skills/epub-translate/scripts/     translator (translate_epub.py, epubdoc.py, prompts/)
+plugins/pdf2epub/skills/epub-translate/scripts/     translator + polish (translate_epub.py, polish_epub_bg.py, epubdoc.py, openai_client.py, prompts/)
 docs/specs/                                         design specs (e.g. image-preservation.md)
 tests/                                              pytest suite + fixtures/ (sample_diagrams.pdf, make_sample.py)
 tmp/                                                checkpoints and logs (not versioned)

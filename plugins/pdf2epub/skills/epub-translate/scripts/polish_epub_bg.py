@@ -25,7 +25,7 @@ import shutil
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -110,13 +110,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_TRANSLATE_TARGET_WORDS,
         help="Word target used when the Gemini run was chunked (default: 1500). "
-        "Must match the original translation so checkpoints line up.",
+        "Must match the original translation so checkpoints line up. "
+        "Format-2 Gemini checkpoints also fingerprint each unit's source text and "
+        "refuse mismatched entries even if the chunk index still exists.",
     )
     p.add_argument(
         "--concurrency",
         type=int,
         default=2,
-        help="Parallel BgGPT calls (default: 2); lower on 429 storms",
+        help="Parallel BgGPT calls for polish chunks and for solo unit retries "
+        "inside a chunk (default: 2); lower on 429 storms",
     )
     p.add_argument(
         "--unit-retries",
@@ -210,18 +213,30 @@ def build_system_prompt(glossary_block: str) -> str:
 
 
 def looks_untranslated(text: str, min_words: int = 8) -> bool:
-    """True when a unit is long enough to judge and still mostly Latin (leftover English).
+    """True when a unit still looks like leftover English (mostly Latin prose).
 
     Pure digit/punctuation lines (countdowns, page ornaments) have no letters, so they
-    are not treated as English leftovers — only real Latin prose is.
+    are not treated as English leftovers. Long units use the usual word/letter floors;
+    shorter high-Latin fragments (dialogue, short sentences) are also flagged so
+    `--english-only` and TOC polish catch them. Names and tiny tokens stay exempt.
     """
     stripped = epubdoc.PLACEHOLDER_RE.sub(" ", text)
-    if len(stripped.split()) < min_words:
-        return False
+    words = stripped.split()
     letters = [c for c in stripped if c.isalpha()]
-    if len(letters) < 24:
+    if not letters:
         return False
-    return epubdoc.cyrillic_ratio(stripped) < CYRILLIC_FLOOR
+    cyr = epubdoc.cyrillic_ratio(stripped)
+    if cyr >= CYRILLIC_FLOOR:
+        return False
+    latin_share = 1.0 - cyr
+    if len(words) >= min_words and len(letters) >= 24:
+        return True
+    # Short high-Latin phrases (e.g. dialogue) — not single/double-token names.
+    if latin_share >= 0.9 and len(words) >= 4 and len(letters) >= 12:
+        return True
+    if latin_share >= 0.9 and len(words) >= 3 and len(letters) >= 16:
+        return True
+    return False
 
 
 def _plain_len(text: str) -> int:
@@ -371,24 +386,30 @@ def _polish_units(
         stats.bump("blocked")
         parsed = {}
 
+    need_retry: list[tuple[int, PolishUnit]] = []
     for i, item in enumerate(items, 1):
         candidate = parsed.get(i)
         if candidate is not None and unit_ok(item.pre, candidate, item.unit):
             result[i] = candidate
             _bump_accept(stats, item, candidate)
-            continue
-        stats.bump("units_retried")
-        solo = _retry_unit(client, args, system_prompt, item)
-        if solo is not None:
-            result[i] = solo
-            _bump_accept(stats, item, solo)
         else:
-            print(
-                f"  warning: {where} unit {i} polish rejected; kept pre-polish text",
-                file=sys.stderr,
-            )
-            stats.bump("units_kept")
-            result[i] = item.pre
+            need_retry.append((i, item))
+
+    if need_retry:
+        retries = _retry_units_parallel(client, args, system_prompt, need_retry)
+        for i, item in need_retry:
+            stats.bump("units_retried")
+            solo = retries.get(i)
+            if solo is not None:
+                result[i] = solo
+                _bump_accept(stats, item, solo)
+            else:
+                print(
+                    f"  warning: {where} unit {i} polish rejected; kept pre-polish text",
+                    file=sys.stderr,
+                )
+                stats.bump("units_kept")
+                result[i] = item.pre
     return result
 
 
@@ -446,21 +467,128 @@ def _retry_unit(
     return None
 
 
+def _retry_units_parallel(
+    client,
+    args: argparse.Namespace,
+    system_prompt: str,
+    need_retry: list[tuple[int, PolishUnit]],
+) -> dict[int, str | None]:
+    """Solo-retry several units; parallel when more than one needs a network call.
+
+    Chunk-level concurrency already covers independent polish jobs. The remaining
+    latency is often *within* a chunk: the first-pass model response fails validation
+    for several units, and each solo retry is an independent API call. Running those
+    serially multiplies wait time; bounding by `--concurrency` keeps 429 pressure
+    in the same ballpark as parallel chunks.
+    """
+    if not need_retry:
+        return {}
+    if len(need_retry) == 1:
+        i, item = need_retry[0]
+        return {i: _retry_unit(client, args, system_prompt, item)}
+
+    workers = min(len(need_retry), max(1, args.concurrency))
+    out: dict[int, str | None] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_retry_unit, client, args, system_prompt, item): i
+            for i, item in need_retry
+        }
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                out[i] = fut.result()
+            except Exception:
+                # Defensive: _retry_unit already swallows API errors; keep shape stable.
+                out[i] = None
+    return out
+
+
+def _accept_or_retry_cached(
+    client,
+    args: argparse.Namespace,
+    system_prompt: str,
+    items: list[PolishUnit],
+    cached: dict[int, str],
+    stats: PolishStats,
+) -> tuple[dict[int, str], bool]:
+    """Re-validate a cached polish map; parallel-retry units that fail current gates.
+
+    Returns (accepted_map, dirty) where dirty means at least one unit was repaired
+    or fell back to pre-polish text (checkpoint should be rewritten).
+    """
+    accepted: dict[int, str] = {}
+    need_retry: list[tuple[int, PolishUnit]] = []
+    for i, item in enumerate(items, 1):
+        cand = cached.get(i)
+        if cand is not None and unit_ok(item.pre, cand, item.unit):
+            accepted[i] = cand
+            _bump_accept(stats, item, cand)
+        else:
+            need_retry.append((i, item))
+
+    dirty = bool(need_retry)
+    if need_retry:
+        retries = _retry_units_parallel(client, args, system_prompt, need_retry)
+        for i, item in need_retry:
+            solo = retries.get(i)
+            if solo is not None:
+                accepted[i] = solo
+                _bump_accept(stats, item, solo)
+            else:
+                accepted[i] = item.pre
+                stats.bump("units_kept")
+    return accepted, dirty
+
+
 # --------------------------------------------------------------- load / plan
 
 
-def _load_gemini_map(ckpt_dir: Path, chunk_no: int) -> dict[int, str] | None:
-    """Load the Gemini unit map for chunk_no from any matching checkpoint file."""
+def _load_gemini_map(
+    ckpt_dir: Path, chunk_no: int
+) -> dict[int, tuple[str, str | None]] | None:
+    """Load Gemini unit map for chunk_no → {index: (text, source_fp_or_None)}.
+
+    Understands format-2 checkpoints (with per-unit source fingerprints) and the
+    legacy flat `{ "1": "…" }` shape. Prefer the newest mtime when multiple prompt
+    hashes exist for the same chunk number.
+    """
     matches = sorted(ckpt_dir.glob(f"chunk_{chunk_no:04d}_*.json"))
     if not matches:
         return None
-    # Prefer the newest mtime when multiple prompt hashes exist
     path = max(matches, key=lambda p: p.stat().st_mtime)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return {int(k): v for k, v in data.items()}
     except (json.JSONDecodeError, ValueError, TypeError):
         return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("format") == 2 and isinstance(data.get("units"), dict):
+        out: dict[int, tuple[str, str | None]] = {}
+        for k, v in data["units"].items():
+            if isinstance(v, dict) and isinstance(v.get("t"), str):
+                fp = v.get("s")
+                out[int(k)] = (v["t"], fp if isinstance(fp, str) else None)
+        return out or None
+    flat = {
+        int(k): (v, None) for k, v in data.items() if isinstance(v, str)
+    }
+    return flat or None
+
+
+def pre_is_structurally_safe(unit: epubdoc.Unit, pre: str) -> bool:
+    """True if `pre` can rebuild onto `unit` without emptying emphasis or breaking tags.
+
+    Used when seeding the apply set from Gemini checkpoints so a laxer older map
+    cannot reintroduce emptied markup into the polished EPUB.
+    """
+    if not pre or pre == unit.text:
+        return True
+    if not epubdoc.can_apply(unit, pre):
+        return False
+    if not epubdoc.keeps_placeholder_content(unit.text, pre):
+        return False
+    return True
 
 
 def plan_from_workdir(
@@ -489,6 +617,8 @@ def plan_from_workdir(
     polish_items: list[PolishUnit] = []
     gemini_job = 0
     missing_ckpts = 0
+    fp_mismatches = 0
+    legacy_maps = 0
     en_leftovers = 0
 
     for doc in docs:
@@ -509,8 +639,18 @@ def plan_from_workdir(
             gmap = _load_gemini_map(gemini_chunks, gemini_job)
             if gmap is None:
                 missing_ckpts += 1
+            elif any(fp is None for _, fp in gmap.values()):
+                legacy_maps += 1
             for i, unit in enumerate(chunk, 1):
-                pre = gmap.get(i, unit.text) if gmap else unit.text
+                pre = unit.text
+                if gmap and i in gmap:
+                    text, fp = gmap[i]
+                    if fp is not None and fp != epubdoc.source_fingerprint(unit.text):
+                        # Chunk index exists but holds a different source unit —
+                        # wrong --translate-target-words / doc set. Do not apply.
+                        fp_mismatches += 1
+                    else:
+                        pre = text
                 source_en = unit.text if args.with_source_en else None
                 if looks_untranslated(pre):
                     en_leftovers += 1
@@ -520,6 +660,19 @@ def plan_from_workdir(
         print(
             f"  warning: {missing_ckpts} Gemini chunk checkpoint(s) missing — "
             "those units use source English and will be translated by BgGPT",
+            file=sys.stderr,
+        )
+    if fp_mismatches:
+        print(
+            f"  warning: {fp_mismatches} Gemini unit(s) refused: source fingerprint "
+            "mismatch (check --translate-target-words / --doc-filter match the "
+            "original translate run). Those units stay in source English.",
+            file=sys.stderr,
+        )
+    if legacy_maps:
+        print(
+            "  note: some Gemini checkpoints lack source fingerprints (pre-format-2); "
+            "alignment is trusted by chunk index only — re-run translate for safer polish",
             file=sys.stderr,
         )
     if en_leftovers:
@@ -697,23 +850,10 @@ def main() -> None:
                         int(k): v
                         for k, v in json.loads(ckpt.read_text(encoding="utf-8")).items()
                     }
-                    # Re-validate against current rules; drop bad cache entries per unit
-                    accepted: dict[int, str] = {}
-                    dirty = False
-                    for i, item in enumerate(items, 1):
-                        cand = cached.get(i)
-                        if cand is not None and unit_ok(item.pre, cand, item.unit):
-                            accepted[i] = cand
-                            _bump_accept(stats, item, cand)
-                            continue
-                        dirty = True
-                        solo = _retry_unit(client, args, system_prompt, item)
-                        if solo is not None:
-                            accepted[i] = solo
-                            _bump_accept(stats, item, solo)
-                        else:
-                            accepted[i] = item.pre
-                            stats.bump("units_kept")
+                    # Re-validate against current rules; solo-retry failures in parallel
+                    accepted, dirty = _accept_or_retry_cached(
+                        client, args, system_prompt, items, cached, stats
+                    )
                     if dirty:
                         common.atomic_write(
                             ckpt,
@@ -763,15 +903,34 @@ def main() -> None:
     # workdir mode: unit.text is still the English source; pre is Gemini BG (or leftover
     # EN). Seed every unit from the full pre-polish set (all_items), then overlay accepted
     # polish results. English-only / max-chunks still yield a full Bulgarian book.
+    # Re-validate Gemini `pre` (and final overlays) with structural checks so a laxer
+    # older checkpoint cannot empty emphasis into the polished EPUB.
     final_by_unit: dict[int, str] = {}
     for item in all_items:
         if item.pre and item.pre != item.unit.text:
-            final_by_unit[id(item.unit)] = item.pre
+            if pre_is_structurally_safe(item.unit, item.pre):
+                final_by_unit[id(item.unit)] = item.pre
+            else:
+                print(
+                    "  warning: Gemini pre failed structural checks; "
+                    "kept source text for that unit",
+                    file=sys.stderr,
+                )
+                stats.bump("units_kept")
     for _, items, out in results:
         for i, item in enumerate(items, 1):
             text = out.get(i, item.pre)
-            if text and text != item.unit.text:
-                final_by_unit[id(item.unit)] = text
+            if not text or text == item.unit.text:
+                continue
+            if not pre_is_structurally_safe(item.unit, text):
+                # Leave whatever was already seeded (safe pre, or nothing).
+                print(
+                    "  warning: polished unit failed structural checks; not applied",
+                    file=sys.stderr,
+                )
+                stats.bump("units_kept")
+                continue
+            final_by_unit[id(item.unit)] = text
 
     for item in all_items:
         text = final_by_unit.get(id(item.unit))
@@ -823,6 +982,7 @@ def _polish_navigation(
 
     Already-Bulgarian labels are left alone: a full-TOC rewrite risks drifting
     good titles and can blow the output token budget on large nav documents.
+    Uses full text content so span-wrapped EPUB3 nav entries are included.
     """
     for nav in epubdoc.ncx_paths(opf):
         try:
@@ -833,12 +993,8 @@ def _polish_navigation(
         if root is None:
             continue
         items: list[PolishUnit] = []
-        for el in root.iter():
-            name = epubdoc.local_name(el.tag)
-            if name not in ("text", "a"):
-                continue
-            text = (el.text or "").strip()
-            if not text or not looks_untranslated(text):
+        for el, text in epubdoc.find_nav_labels(root):
+            if not looks_untranslated(text):
                 continue
             items.append(PolishUnit(unit=epubdoc.Unit(element=el, text=text), pre=text))
         if not items:
@@ -873,12 +1029,14 @@ def _polish_navigation(
             text = (parsed.get(i) or "").strip()
             if not text:
                 continue
-            # Reject if still looks English
+            # Reject if still looks English / is an echo of the source label
             if looks_untranslated(text):
                 continue
-            if _plain_words(text) >= 8 and epubdoc.cyrillic_ratio(text) < CYRILLIC_FLOOR:
+            if text.casefold() == item.pre.casefold():
                 continue
-            item.unit.element.text = text
+            if _plain_words(text) >= 3 and epubdoc.cyrillic_ratio(text) < CYRILLIC_FLOOR:
+                continue
+            epubdoc.set_nav_label(item.unit.element, text)
             changed += 1
             stats.bump("units_retranslated")
         if changed:

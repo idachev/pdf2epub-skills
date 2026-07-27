@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 import threading
@@ -53,6 +54,9 @@ CYRILLIC_SCRIPTS = {"bg", "ru", "uk", "sr", "mk", "be"}
 # something; wide because languages legitimately differ in wordiness, and this is only
 # meant to catch a fragment or a summary coming back in place of a translation
 WORD_RATIO_BOUNDS = (0.5, 1.9)
+# Checkpoint payload version: v2 stores per-unit source fingerprints so polish (or any
+# re-chunker) can refuse maps that no longer line up with the EPUB text.
+CHECKPOINT_FORMAT = 2
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,6 +178,78 @@ def build_system_prompt(args: argparse.Namespace, glossary_block: str) -> str:
     )
 
 
+# --------------------------------------------------------------- checkpoints / echo
+
+
+def dump_unit_checkpoint(units: list[epubdoc.Unit], result: dict[int, str]) -> str:
+    """Serialize a chunk map with source fingerprints (format 2)."""
+    payload = {
+        "format": CHECKPOINT_FORMAT,
+        "units": {
+            str(i): {
+                "t": result[i],
+                "s": epubdoc.source_fingerprint(units[i - 1].text),
+            }
+            for i in sorted(result)
+            if 1 <= i <= len(units)
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def load_unit_checkpoint(raw: str | dict) -> dict[int, str]:
+    """Load a chunk map from format-2 or legacy flat JSON."""
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint is not an object")
+    if data.get("format") == CHECKPOINT_FORMAT and isinstance(data.get("units"), dict):
+        out: dict[int, str] = {}
+        for k, v in data["units"].items():
+            if isinstance(v, dict) and isinstance(v.get("t"), str):
+                out[int(k)] = v["t"]
+        return out
+    # Legacy: {"1": "…", "2": "…"} — string values only
+    return {int(k): v for k, v in data.items() if isinstance(v, str)}
+
+
+def load_unit_checkpoint_with_fps(
+    raw: str | dict,
+) -> dict[int, tuple[str, str | None]]:
+    """Load {index: (text, source_fp_or_None)} for polish alignment checks."""
+    data = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(data, dict):
+        raise ValueError("checkpoint is not an object")
+    if data.get("format") == CHECKPOINT_FORMAT and isinstance(data.get("units"), dict):
+        out: dict[int, tuple[str, str | None]] = {}
+        for k, v in data["units"].items():
+            if isinstance(v, dict) and isinstance(v.get("t"), str):
+                fp = v.get("s")
+                out[int(k)] = (v["t"], fp if isinstance(fp, str) else None)
+        return out
+    return {
+        int(k): (v, None) for k, v in data.items() if isinstance(v, str)
+    }
+
+
+def _normalize_for_echo(text: str) -> str:
+    plain = epubdoc.PLACEHOLDER_RE.sub(" ", text)
+    return " ".join(plain.casefold().split())
+
+
+def looks_like_echo(source: str, candidate: str, min_words: int = 8) -> bool:
+    """True when a long candidate is essentially the source (wholesale non-translation).
+
+    Used for every target language: Cyrillic script checks miss Latin-script targets
+    (de/fr/es/…), and an exact echo is never a useful translation for prose units.
+    Short units (names, numerals) are exempt — they legitimately equal the source.
+    """
+    src = _normalize_for_echo(source)
+    cand = _normalize_for_echo(candidate)
+    if len(src.split()) < min_words:
+        return False
+    return bool(src) and src == cand
+
+
 # --------------------------------------------------------------- per-chunk translation
 
 
@@ -226,6 +302,23 @@ def _translate_units(
         parsed = epubdoc.parse_chunk(raw, expected)
     except (common.PromptBlockedError, common.EmptyResponseError) as e:
         print(f"  warning: {where} blocked/empty ({e}); falling back per unit", file=sys.stderr)
+        stats.bump("blocked")
+        parsed = {}
+    except SystemExit as e:
+        # common.generate calls sys.exit after exhausting rate-limit retries. Degrade
+        # this chunk so sibling workers can finish and checkpoints already written
+        # stay usable, rather than aborting the whole concurrent run mid-flight.
+        print(
+            f"  warning: {where} Gemini call aborted ({e}); falling back per unit",
+            file=sys.stderr,
+        )
+        stats.bump("blocked")
+        parsed = {}
+    except Exception as e:
+        # Non-retryable APIError and other transport failures: one bad request must
+        # not discard the rest of the book. Auth/quota hard failures will fail the
+        # solo retries too and surface as verbatim units.
+        print(f"  warning: {where} failed ({e}); falling back per unit", file=sys.stderr)
         stats.bump("blocked")
         parsed = {}
 
@@ -335,7 +428,9 @@ def _translate_once(
             client, model, epubdoc.render_chunk([unit]), system_prompt,
             temperature=0.3, thinking_level=thinking,
         )
-    except (common.PromptBlockedError, common.EmptyResponseError):
+    except (common.PromptBlockedError, common.EmptyResponseError, SystemExit):
+        return None
+    except Exception:
         return None
     return epubdoc.parse_chunk(raw, 1).get(1)
 
@@ -364,11 +459,37 @@ def _unit_ok(unit: epubdoc.Unit, candidate: str, args: argparse.Namespace) -> bo
         ratio = len(epubdoc.PLACEHOLDER_RE.sub(" ", candidate).split()) / src_words
         if not WORD_RATIO_BOUNDS[0] <= ratio <= WORD_RATIO_BOUNDS[1]:
             return False
+    # Wholesale echo (any target language). Latin-script targets have no Cyrillic
+    # floor, so without this a model that returns the English source is accepted.
+    if looks_like_echo(unit.text, candidate):
+        return False
     if args.target_language.split("-")[0].lower() in CYRILLIC_SCRIPTS:
         stripped = epubdoc.PLACEHOLDER_RE.sub(" ", candidate)
         # Short units are legitimately all-Latin (a name, a number, "OK") — only
         # judge the script of units long enough for the ratio to mean something.
         if len(stripped.split()) >= 8 and epubdoc.cyrillic_ratio(stripped) < CYRILLIC_FLOOR:
+            return False
+    return True
+
+
+def _nav_label_ok(source: str, candidate: str, args: argparse.Namespace) -> bool:
+    """Accept a TOC label only if it looks translated — same spirit as body units."""
+    if not candidate or not candidate.strip():
+        return False
+    cand = candidate.strip()
+    src_words = len(source.split())
+    cand_words = len(cand.split())
+    # TOC titles are short; use looser length bounds than body prose.
+    if src_words >= 3:
+        ratio = cand_words / src_words
+        if not 0.3 <= ratio <= 3.0:
+            return False
+    # Echo of the source title (any language). Floor is lower than body prose so a
+    # 4-word chapter title that comes back unchanged is still rejected.
+    if looks_like_echo(source, cand, min_words=4):
+        return False
+    if args.target_language.split("-")[0].lower() in CYRILLIC_SCRIPTS:
+        if cand_words >= 3 and epubdoc.cyrillic_ratio(cand) < CYRILLIC_FLOOR:
             return False
     return True
 
@@ -448,27 +569,28 @@ def main() -> None:
         ckpt = ckpt_dir / f"chunk_{n:04d}_{key}.json"
         if ckpt.exists():
             try:
-                cached = {int(k): v for k, v in json.loads(ckpt.read_text(encoding="utf-8")).items()}
+                cached = load_unit_checkpoint(ckpt.read_text(encoding="utf-8"))
                 stats.bump("cached")
                 repaired = _repair_verbatim(client, args, system_prompt, units, cached, n, stats)
                 if repaired:
-                    common.atomic_write(
-                        ckpt, json.dumps({str(k): v for k, v in cached.items()}, ensure_ascii=False)
-                    )
+                    common.atomic_write(ckpt, dump_unit_checkpoint(units, cached))
                     print(f"[{n}/{len(jobs)}] cached, repaired {repaired} unit(s)")
                 else:
                     print(f"[{n}/{len(jobs)}] cached")
                 return n, doc, units, cached
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError):
                 pass  # corrupt checkpoint — retranslate
         out = _translate_units(client, args, system_prompt, units, f"chunk {n}", stats)
-        common.atomic_write(ckpt, json.dumps({str(k): v for k, v in out.items()}, ensure_ascii=False))
+        common.atomic_write(ckpt, dump_unit_checkpoint(units, out))
         stats.bump("chunks")
         print(f"[{n}/{len(jobs)}] translated ({sum(u.words for u in units)} words)")
         return n, doc, units, out
 
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
         futures = [pool.submit(run_job, job) for job in jobs]
+        # Per-chunk handlers already degrade on SystemExit/API errors; a remaining
+        # SystemExit would be unexpected (e.g. missing API key at client init, which
+        # happens before the pool). Cancel siblings so we do not keep spending.
         try:
             results = [f.result() for f in futures]
         except SystemExit:
@@ -492,7 +614,7 @@ def main() -> None:
         if doc in touched:
             epubdoc.write_document(doc, tree)
 
-    translate_navigation(client, args, system_prompt, opf)
+    translate_navigation(client, args, system_prompt, opf, ckpt_dir)
     epubdoc.set_opf_metadata(opf, args.target_language, args.title_suffix)
 
     out_path = args.output or args.input_epub.with_name(
@@ -522,11 +644,20 @@ def main() -> None:
         )
 
 
-def translate_navigation(client, args: argparse.Namespace, system_prompt: str, opf: Path) -> None:
+def translate_navigation(
+    client,
+    args: argparse.Namespace,
+    system_prompt: str,
+    opf: Path,
+    ckpt_dir: Path | None = None,
+) -> None:
     """Translate TOC labels so the e-reader's navigation is in the target language.
 
     Without this a fully translated book still shows an English table of contents,
-    which is the first thing the reader sees.
+    which is the first thing the reader sees. Labels use full text content (so
+    span-wrapped EPUB3 nav entries are included), acceptance mirrors body gates
+    (echo / script / rough length), and successful maps are checkpointed so a
+    resume does not re-bill or churn TOC wording.
     """
     thinking = None if args.thinking_level == "none" else args.thinking_level
     for nav in epubdoc.ncx_paths(opf):
@@ -537,37 +668,72 @@ def translate_navigation(client, args: argparse.Namespace, system_prompt: str, o
         root = tree.getroot()
         if root is None:
             continue
-        labels: list[etree._Element] = []
-        for el in root.iter():
-            name = epubdoc.local_name(el.tag)
-            if name in ("text", "a") and (el.text or "").strip():
-                labels.append(el)
+        labels = epubdoc.find_nav_labels(root)
         if not labels:
             continue
-        units = [epubdoc.Unit(element=el, text=(el.text or "").strip()) for el in labels]
-        payload = epubdoc.render_chunk(units)
-        try:
-            raw = common.generate(
-                client, args.model, payload, system_prompt,
-                temperature=0.3, thinking_level=thinking,
-            )
-            parsed = epubdoc.parse_chunk(raw, len(units))
-        except (common.PromptBlockedError, common.EmptyResponseError):
-            print(f"  warning: could not translate navigation in {nav.name}", file=sys.stderr)
-            continue
+        sources = [text for _, text in labels]
+        payload = "\n".join(f"<<<{i}>>>\n{t}" for i, t in enumerate(sources, 1))
+        parsed: dict[int, str] | None = None
+        ckpt: Path | None = None
+        from_cache = False
+        if ckpt_dir is not None:
+            key = hashlib.sha1(
+                "\x00".join(
+                    [system_prompt, args.model, str(args.thinking_level), payload]
+                ).encode("utf-8")
+            ).hexdigest()[:10]
+            # Include a stable stem so two nav docs with identical labels don't clash
+            safe_name = re.sub(r"[^\w.-]+", "_", nav.name)
+            ckpt = ckpt_dir / f"nav_{safe_name}_{key}.json"
+            if ckpt.exists():
+                try:
+                    parsed = load_unit_checkpoint(ckpt.read_text(encoding="utf-8"))
+                    from_cache = True
+                    print(f"navigation: cached labels for {nav.name}")
+                except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+                    parsed = None
+        if parsed is None:
+            try:
+                raw = common.generate(
+                    client, args.model, payload, system_prompt,
+                    temperature=0.3, thinking_level=thinking,
+                )
+                parsed = epubdoc.parse_chunk(raw, len(sources))
+            except (common.PromptBlockedError, common.EmptyResponseError, SystemExit) as e:
+                print(
+                    f"  warning: could not translate navigation in {nav.name} ({e})",
+                    file=sys.stderr,
+                )
+                continue
+            except Exception as e:
+                print(
+                    f"  warning: could not translate navigation in {nav.name} ({e})",
+                    file=sys.stderr,
+                )
+                continue
+        # Apply with live gates (also re-checks a cached map if acceptance tightened).
+        accepted: dict[int, str] = {}
         changed = 0
-        for i, unit in enumerate(units, 1):
-            text = parsed.get(i)
-            if text and text.strip():
-                unit.element.text = text.strip()
-                changed += 1
-        epubdoc.write_document(nav, tree)
-        print(f"navigation: {changed}/{len(units)} label(s) translated in {nav.name}")
-        if changed < len(units):
+        for i, (el, source) in enumerate(labels, 1):
+            text = (parsed.get(i) or "").strip() if parsed else ""
+            if not _nav_label_ok(source, text, args):
+                continue
+            epubdoc.set_nav_label(el, text)
+            accepted[i] = text
+            changed += 1
+        if changed and ckpt is not None and not from_cache:
+            # Checkpoint only accepted labels so a resume does not re-bill the TOC
+            # and cannot re-apply a previously rejected echo.
+            units_for_fp = [epubdoc.Unit(element=el, text=src) for el, src in labels]
+            common.atomic_write(ckpt, dump_unit_checkpoint(units_for_fp, accepted))
+        if changed:
+            epubdoc.write_document(nav, tree)
+        print(f"navigation: {changed}/{len(labels)} label(s) translated in {nav.name}")
+        if changed < len(labels):
             # Silently leaving part of the TOC in English is a visible defect — the
             # table of contents is the first thing the reader opens.
             print(
-                f"  warning: {len(units) - changed} navigation label(s) in {nav.name} "
+                f"  warning: {len(labels) - changed} navigation label(s) in {nav.name} "
                 "kept in the source language",
                 file=sys.stderr,
             )
