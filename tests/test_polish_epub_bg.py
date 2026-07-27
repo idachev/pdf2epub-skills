@@ -97,20 +97,20 @@ def patched(monkeypatch):
 
 
 def test_bulgarian_prose_is_not_flagged_as_english():
-    text = "Той погледна пустинята и си спомни за старите дни на Каладан."
+    text = "Той погледна пристанището и си спомни за старите дни в Ривъртон."
     assert not polish.looks_untranslated(text)
 
 
 def test_long_english_leftover_is_flagged():
     text = (
-        "He looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons."
+        "He looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights."
     )
     assert polish.looks_untranslated(text)
 
 
 def test_short_latin_name_is_not_flagged():
-    assert not polish.looks_untranslated("Duncan Idaho")
+    assert not polish.looks_untranslated("Marco Velez")
 
 
 def test_digit_countdown_is_not_flagged():
@@ -160,8 +160,8 @@ def test_rejects_summarized_polish():
 def test_rejects_english_echo_as_polish_output():
     """A long Latin response fails the Cyrillic floor — catches failed EN→BG."""
     pre = (
-        "He looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons of the northern sky."
+        "He looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights of the evening market."
     )
     unit = make_unit(pre)
     assert not polish.unit_ok(pre, pre, unit)
@@ -169,13 +169,13 @@ def test_rejects_english_echo_as_polish_output():
 
 def test_accepts_en_to_bg_retranslation():
     pre = (
-        "He looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons of the northern sky."
+        "He looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights of the evening market."
     )
     unit = make_unit(pre)
     bg = (
-        "Той се вгледа в пустинята и си спомни старите дни на Каладан, "
-        "когато моретата още пееха под луните на северното небе."
+        "Той се вгледа в пристанището и си спомни старите дни в Ривъртон, "
+        "когато камбаните още биеха под светлините на вечерния пазар."
     )
     assert polish.unit_ok(pre, bg, unit)
 
@@ -210,12 +210,12 @@ def test_polish_retries_then_keeps_pre_on_failure(patched):
 
 def test_polish_retranslates_english_leftover(patched):
     en = (
-        "He looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons of the northern sky."
+        "He looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights of the evening market."
     )
     bg = (
-        "Той се вгледа в пустинята и си спомни старите дни на Каладан, "
-        "когато моретата още пееха под луните на северното небе."
+        "Той се вгледа в пристанището и си спомни старите дни в Ривъртон, "
+        "когато камбаните още биеха под светлините на вечерния пазар."
     )
     unit = make_unit(en)
     item = polish.PolishUnit(unit=unit, pre=en)
@@ -251,10 +251,10 @@ def test_chunk_polish_items_respects_target():
 
 def test_english_only_filter_keeps_latin_prose():
     en = (
-        "He looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons of the northern sky."
+        "He looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights of the evening market."
     )
-    bg = "Той се вгледа в пустинята и си спомни старите дни на Каладан."
+    bg = "Той се вгледа в пристанището и си спомни старите дни в Ривъртон."
     items = [
         polish.PolishUnit(unit=make_unit(en), pre=en),
         polish.PolishUnit(unit=make_unit(bg), pre=bg),
@@ -270,15 +270,15 @@ def test_english_only_must_not_drop_non_english_from_apply_set():
     in English source text.
     """
     en = (
-        "He looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons of the northern sky."
+        "He looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights of the evening market."
     )
-    bg = "Той се вгледа в пустинята и си спомни старите дни на Каладан."
+    bg = "Той се вгледа в пристанището и си спомни старите дни в Ривъртон."
     # Simulate workdir units: unit.text is still English source; pre is Gemini BG
     # for successful units and English for leftovers.
     src_ok = make_unit(
-        "She looked out across the desert and remembered the old days on Caladan "
-        "when the seas still sang under the moons of the northern sky."
+        "She looked out across the harbor and remembered the old days in Riverton "
+        "when the bells still rang under the lights of the evening market."
     )
     src_en = make_unit(en)
     all_items = [

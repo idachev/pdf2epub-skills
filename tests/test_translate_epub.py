@@ -199,10 +199,10 @@ def test_rejects_an_untranslated_echo():
 def test_short_units_are_exempt_from_the_script_check():
     """A name or numeral legitimately stays in Latin script."""
     root = etree.fromstring(
-        f'<html xmlns="{XHTML}"><body><p>Duncan</p></body></html>'.encode("utf-8")
+        f'<html xmlns="{XHTML}"><body><p>Marco</p></body></html>'.encode("utf-8")
     )
     (unit,) = epubdoc.find_units(root)
-    assert te._unit_ok(unit, "Duncan", args())
+    assert te._unit_ok(unit, "Marco", args())
 
 
 # ------------------------------------------------------------- verbatim repair
@@ -265,7 +265,7 @@ def test_repair_skips_short_units_that_translate_to_themselves(patched):
     """A name or numeral always equals its source, so retrying it would burn a call
     on every resume and never change anything."""
     fake = patched({"primary": [GOOD]})
-    unit = make_unit("Duncan")
+    unit = make_unit("Marco")
     cached = _cached_chunk(unit.text)
     n = te._repair_verbatim(
         None, args(repair_verbatim=True), "sys", [unit], cached, 1, te.ChunkStats()
