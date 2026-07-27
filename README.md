@@ -16,7 +16,7 @@ Both work with books in any language — for conversion, title, author, and lang
 /plugin install pdf2epub@pdf2epub-skills
 ```
 
-Then ask Claude Code to convert a PDF (*"Convert /path/to/my-book.pdf to EPUB"*) or to translate one (*"Translate /path/to/book.epub into Bulgarian"*), and it will invoke the matching skill.
+Then ask Claude Code to convert a PDF (*"Convert /path/to/my-book.pdf to EPUB"*), translate one (*"Translate /path/to/book.epub into Bulgarian"*), or polish a Bulgarian translation (*"Polish this BG EPUB with BgGPT"*), and it will invoke the matching skill.
 
 ## How it works
 
@@ -82,7 +82,7 @@ uv run .../translate_epub.py "book.epub" -t bg --glossary g.json \
 
 ### Bulgarian polish (BgGPT, optional)
 
-After Gemini translation to Bulgarian, an optional second pass uses [BgGPT](https://models.bggpt.ai/docs) to polish literary Bulgarian and **retranslate any paragraphs still left in English** (content-filter give-ups). It does not re-call Gemini; checkpoints live under `polish/` beside the original `chunks/`.
+After Gemini translation to Bulgarian, an optional second pass uses [BgGPT](https://models.bggpt.ai/docs) to polish literary Bulgarian and **retranslate any paragraphs still left in English** (content-filter give-ups). It is **opt-in** (not wired into `translate_epub.py -t bg`), does not re-call Gemini, and keeps its own checkpoints under `polish/` so Gemini `chunks/` stay the recoverable baseline. Pass the same `--glossary` you used for translation when you have one.
 
 ```bash
 # From an existing Gemini workdir
@@ -95,10 +95,17 @@ uv run plugins/pdf2epub/skills/epub-translate/scripts/polish_epub_bg.py \
 # Or from an already-emitted BG EPUB
 uv run plugins/pdf2epub/skills/epub-translate/scripts/polish_epub_bg.py \
   --input-epub path/to/book.bg.epub \
-  -o path/to/book.bg.polished.epub
+  -o path/to/book.bg.polished.epub \
+  --glossary path/to/glossary.json
+
+# Targeted repair: only leftover English units (keeps the rest of the book as-is)
+uv run plugins/pdf2epub/skills/epub-translate/scripts/polish_epub_bg.py \
+  --input-epub path/to/book.bg.polished.epub \
+  -o path/to/book.bg.polished.epub \
+  --english-only --force --glossary path/to/glossary.json
 ```
 
-Requires `BGGPT_API_KEY`. Optional: `BGGPT_BASE_URL` (local OpenAI-compatible server), `BGGPT_MODEL` (default `bggpt-gemma-3-27b-fp8`). Smoke with `--max-chunks 2` or `--dry-run-sample 5` before a full book.
+Requires `BGGPT_API_KEY`. Optional: `BGGPT_BASE_URL` (local OpenAI-compatible server), `BGGPT_MODEL` (default `bggpt-gemma-3-27b-fp8`). Smoke with `--max-chunks 2` or `--dry-run-sample 5` before a full book. Full flag list: `epub-translate` skill docs (`SKILL.md`).
 
 ## Requirements
 

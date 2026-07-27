@@ -19,6 +19,7 @@ pdf2epub-skills/
 ├── LICENSE                                      # MIT
 ├── .claude-plugin/marketplace.json              # this repo is a Claude Code plugin marketplace
 ├── .github/workflows/ci.yml                     # manifest validation + unit tests
+├── docs/plans/                                  # design notes (e.g. BgGPT polish plan)
 ├── plugins/pdf2epub/
 │   ├── .claude-plugin/plugin.json               # the single plugin this marketplace hosts
 │   ├── skills/pdf2epub/                         # skill 1: PDF -> EPUB
@@ -40,7 +41,8 @@ The plugin `version` lives only in `plugins/pdf2epub/.claude-plugin/plugin.json`
 
 **Glossaries are never committed here.** They encode terminology for one specific book or series and belong in that book's own working directory, passed via `--glossary PATH`. This repo is public; keep third-party series terminology and published-translation references out of it.
 
-Run tests offline (no API key needed): `uvx --with pymupdf --with lxml pytest tests/ -q`
+Run tests offline (no API key needed): `uvx --with pymupdf --with lxml pytest tests/ -q`  
+(`openai` is not required for unit tests — the polish client is mocked / imported lazily.)
 
 ## Local validation
 

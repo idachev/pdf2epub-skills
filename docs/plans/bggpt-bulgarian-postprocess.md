@@ -9,6 +9,7 @@ Related code: `plugins/pdf2epub/skills/epub-translate/scripts/{polish_epub_bg.py
 - Sibling script `polish_epub_bg.py` (Option B) with workdir + `--input-epub` modes.
 - Prompt explicitly detects leftover English (Gemini refusals) and **retranslates** those units to Bulgarian, not only in-language polish.
 - Default still opt-in (not wired into `translate_epub.py -t bg`).
+- Also shipped: `--english-only` (API only leftover-EN units; apply path still uses full Gemini baseline in workdir mode), `--with-source-en`, EN-only TOC retranslation, OpenAI-compatible local base URL, glossary injection, offline mocked tests.
 
 ## 1. Problem
 
