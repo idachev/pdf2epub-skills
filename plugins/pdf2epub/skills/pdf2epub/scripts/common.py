@@ -163,8 +163,17 @@ def generate(
     system_instruction: str,
     max_retries: int = 5,
     temperature: float = 0.1,
+    thinking_level: str | None = None,
 ) -> str:
-    """generate_content with exponential backoff on rate limits / transient errors."""
+    """generate_content with exponential backoff on rate limits / transient errors.
+
+    `thinking_level` ("minimal"/"low"/"medium"/"high") is a Gemini-3-only knob. Left
+    None the request carries no thinking_config at all, so behaviour — and the set of
+    models that accept the request — is exactly as before. Callers doing bulk,
+    mechanical work (cleanup, translation) should pass "low": thinking tokens bill at
+    the output rate, and the API default of "medium" is a large avoidable cost over a
+    whole book.
+    """
     from google.genai import errors, types
 
     delay = 5.0
@@ -172,12 +181,15 @@ def generate(
     last_was_empty = False
     for attempt in range(max_retries + 1):
         try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction, temperature=temperature
+            )
+            if thinking_level is not None:
+                config.thinking_config = types.ThinkingConfig(thinking_level=thinking_level)
             resp = client.models.generate_content(
                 model=model,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction, temperature=temperature
-                ),
+                config=config,
             )
             if resp.prompt_feedback and resp.prompt_feedback.block_reason:
                 # deterministic input block (e.g. copyrighted-text filter) — no point retrying

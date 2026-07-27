@@ -15,7 +15,15 @@ jobs:
         run: |
           python3 -m json.tool .claude-plugin/marketplace.json > /dev/null
           python3 -m json.tool plugins/pdf2epub/.claude-plugin/plugin.json > /dev/null
+      - name: Check every skill has frontmatter
+        run: |
+          for skill in plugins/pdf2epub/skills/*/SKILL.md; do
+            head -n 1 "$skill" | grep -qx -- '---' || { echo "missing frontmatter: $skill"; exit 1; }
+            grep -qE '^name: ' "$skill" || { echo "missing name: $skill"; exit 1; }
+            grep -qE '^description: ' "$skill" || { echo "missing description: $skill"; exit 1; }
+          done
       - name: Run unit tests
         # pin the interpreter: common.py uses PEP 604 unions, which need Python >= 3.10
         # pymupdf: figure-detection tests build synthetic PDFs in-memory
-        run: uvx --python 3.12 --with pymupdf pytest tests/ -q
+        # lxml: epubdoc tests parse/rebuild synthetic XHTML and EPUB containers
+        run: uvx --python 3.12 --with pymupdf --with lxml pytest tests/ -q
