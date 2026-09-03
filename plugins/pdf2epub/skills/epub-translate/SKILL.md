@@ -1,6 +1,6 @@
 ---
 name: epub-translate
-description: Translate an existing EPUB into another language with Gemini, preserving the book's structure, markup, images, and reading order. Inline tags survive word-order changes, chapter titles and the table of contents are translated too, and a user-supplied glossary keeps invented terminology consistent across the whole book. For Bulgarian targets, an optional BgGPT post-pass polishes prose and retranslates any English leftovers Gemini refused. Use when the user asks to translate an EPUB or e-book into another language, localize a book they own, polish a Bulgarian translation, or resume/retry a previous translation.
+description: Use when the user asks to translate an EPUB or e-book into another language, to localize a book they own, to keep invented terminology consistent across a whole translated book, to polish a Bulgarian translation, or to resume or retry a translation that stopped part-way.
 ---
 
 # EPUB Translator (structure-preserving, Gemini)

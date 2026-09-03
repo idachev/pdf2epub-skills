@@ -1,6 +1,6 @@
 ---
 name: pdf2epub
-description: Convert a text-based PDF book into a clean, e-reader-ready EPUB using local PyMuPDF4LLM extraction plus Gemini text cleanup. Works with any source language — title, author, and language are auto-detected. Use when the user asks to convert a PDF book to EPUB, clean up a scanned/exported PDF for Kindle or another e-reader, or resume/retry a previous conversion.
+description: Use when the user asks to convert a PDF book into an EPUB, to clean up an exported or scanned PDF for Kindle or another e-reader, or to resume or retry a conversion that stopped part-way. Applies in any source language, and when the user does not know the book's title, author or language.
 ---
 
 # PDF to EPUB Converter (PyMuPDF4LLM + Gemini)
